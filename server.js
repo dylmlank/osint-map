@@ -8,6 +8,7 @@ import { dirname, extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as F from './feeds.js';
 import { createWatch, AREA_RULES } from './watch.js';
+import { createHistory } from './history.js';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PUBLIC = join(ROOT, 'public');
@@ -35,7 +36,13 @@ const FEEDS = {
   cameras:  { fn: F.cameras,         every: 10 * M },
   cables:   { fn: F.cables,          every: 24 * H },
   plants:   { fn: F.powerPlants,     every: 24 * H },
+  sanctions:  { fn: F.sanctions,       every: 24 * H },
+  sanctioned: { fn: F.sanctionedShips, every: 1 * M,  live: true },
+  dark:       { fn: F.darkShips,       every: 1 * M,  live: true },
+  jamming:    { fn: F.jamming,         every: 1 * M,  live: true },
+  satellites: { fn: F.satellites,      every: 10 * M }, // cheap: only downloads when due (see feeds.js)
 };
+F.startHotspots();
 
 for (const [name, feed] of Object.entries(FEEDS)) {
   feed.json = null; feed.gz = null; feed.data = null; feed.updated = 0; feed.checked = 0; feed.error = '';
@@ -83,6 +90,45 @@ function broadcastAll(event, json) {
 }
 
 const watch = createWatch({ dir: join(ROOT, 'data'), feeds: FEEDS, broadcast: broadcastAll });
+
+// ---------- timeline recording ----------
+// flights: [hex, call, lat, lon, alt (-1 = on ground), track, speed, flags (1 military, 2 emergency, 4 sanctioned), type]
+// ships:   [mmsi, name, lat, lon, course, speed, type, sanctioned (0/1)]
+const r3 = n => Math.round(n * 1000) / 1000;
+const history = createHistory({
+  dir: join(ROOT, 'data', 'history'),
+  sources: {
+    flights: {
+      every: 60 * S,
+      collect() {
+        const byHex = new Map();
+        for (const f of [...(FEEDS.military.data || []), ...F.knownRegions().flatMap(F.cachedFlights)]) {
+          if (f.lat == null || byHex.has(f.hex)) continue;
+          byHex.set(f.hex, [f.hex, f.call, r3(f.lat), r3(f.lon), f.alt === 'ground' ? -1 : Math.round(+f.alt || 0),
+            Math.round(f.track || 0), Math.round(f.speed || 0), (f.mil ? 1 : 0) | (f.emergency ? 2 : 0) | (f.sanc ? 4 : 0), f.type]);
+        }
+        return [...byHex.values()];
+      },
+    },
+    ships: {
+      every: 5 * M, firstAfter: 90 * S,
+      collect() {
+        const out = [], fresh = Date.now() - 30 * M;
+        for (const s of F.allShips()) {
+          if (s.lat == null || s.seen < fresh) continue;
+          out.push([s.mmsi, s.name || '', r3(s.lat), r3(s.lon), Math.round(s.course || 0), Math.round((s.speed || 0) * 10) / 10, s.type || 0, s.sanc ? 1 : 0]);
+        }
+        return out;
+      },
+    },
+  },
+});
+
+function inBbox(bbox) {
+  if (!bbox) return null;
+  const [w, s, e, n] = bbox.split(',').map(Number);
+  return row => row[2] >= s && row[2] <= n && (w <= e ? row[3] >= w && row[3] <= e : row[3] >= w || row[3] <= e);
+}
 
 async function readJSON(req) {
   let body = '';
@@ -173,6 +219,11 @@ http.createServer(async (req, res) => {
   try {
     if (url.pathname === '/api/stream') return openStream(req, res);
     if (url.pathname === '/api/view') return send(res, updateView(q) ? 204 : 404, '');
+    if (url.pathname === '/api/history') return send(res, 200, history.list());
+    if (url.pathname === '/api/history/at') {
+      try { return send(res, 200, history.at(q.get('kind'), +q.get('t'), inBbox(q.get('bbox')))); }
+      catch (err) { return send(res, 400, { error: err.message }); }
+    }
     if (url.pathname === '/api/watch') {
       if (req.method === 'GET') return send(res, 200, { ...watch.get(), rules: AREA_RULES });
       if (req.method === 'POST') {

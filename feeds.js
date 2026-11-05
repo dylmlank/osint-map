@@ -1,5 +1,12 @@
 // Fetchers for each free public feed. Every function returns plain, slim JSON for the map.
 import zlib from 'node:zlib';
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import * as I from './intel.js';
+
+const { round, parseCsvLine } = I;
+const DATA_DIR = join(dirname(fileURLToPath(import.meta.url)), 'data');
 
 const UA = { 'User-Agent': 'osint-map/0.2 (personal project)' };
 
@@ -37,7 +44,6 @@ export function cached(key, ttlMs, fn, staleMs = 0) {
   return p;
 }
 
-const round = (n, d = 4) => Math.round(n * 10 ** d) / 10 ** d;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // The free flight services rate-limit, so each gets its own queue: requests are spaced out,
@@ -93,14 +99,23 @@ export async function emergencies() {
 }
 
 // ---------- flights (adsb.lol, ODbL) ----------
-function slimFlight(a) {
-  return {
+export function slimFlight(a) {
+  const f = {
     hex: a.hex, call: (a.flight || '').trim(), reg: a.r || '', type: a.t || '',
     lat: a.lat, lon: a.lon, alt: a.alt_baro, speed: a.gs, track: a.track ?? a.true_heading ?? 0,
     squawk: a.squawk || '', mil: Boolean(a.dbFlags & 1),
     emergency: ['7500', '7600', '7700'].includes(a.squawk) || Boolean(a.emergency && a.emergency !== 'none'),
+    nacp: a.nac_p ?? null, // GPS position accuracy category (used for the jamming map)
+    src: a.type || '', ver: a.version ?? null, // where the position came from, ADS-B version
   };
+  const sanc = I.matchAircraft(sanctionsIndex, f.reg);
+  if (sanc) f.sanc = sanc;
+  return f;
 }
+
+// GPS jamming is worked out from every batch of aircraft the server sees.
+const jammingTracker = I.createJammingTracker();
+export const jamming = async () => jammingTracker.summary();
 
 export const regionKey = (lat, lon) => `${Math.round(lat)}:${Math.round(lon)}`;
 
@@ -116,7 +131,9 @@ async function fetchRegion(key) {
   // adsb.fi first (separate rate limit), adsb.lol as backup. Both serve the same readsb format.
   const j = await adsbFi(`https://opendata.adsb.fi/api/v2/lat/${la}/lon/${lo}/dist/250`)
     .catch(() => adsb(`https://api.adsb.lol/v2/point/${la}/${lo}/250`));
-  return (j?.ac || j?.aircraft || []).filter(a => a.lat != null).map(slimFlight);
+  const flights = (j?.ac || j?.aircraft || []).filter(a => a.lat != null).map(slimFlight);
+  jammingTracker.record(flights);
+  return flights;
 }
 
 setInterval(() => {
@@ -126,9 +143,85 @@ setInterval(() => {
   }
 }, 20000).unref();
 
+// Known GPS-jamming areas are sampled in the background (one every 20 s, in turn) so the
+// jamming map has data even where nobody is looking. They're also recorded for the timeline.
+const HOTSPOTS = [
+  [55, 20], [59, 26], [57, 24], [54, 14], [34, 33], [33, 36], [44, 34], [47, 37],
+  [33, 44], [36, 40], [26, 54], [29, 48], [38, 127], [56, 38], [41, 29], [50, 30],
+];
+let hotspotIndex = 0;
+export function startHotspots() {
+  setInterval(() => {
+    const [la, lo] = HOTSPOTS[hotspotIndex++ % HOTSPOTS.length];
+    cached(`fl:${regionKey(la, lo)}`, 60000, () => fetchRegion(regionKey(la, lo))).catch(() => {});
+  }, 20000).unref();
+}
+export const knownRegions = () => [...new Set([...recentRegions.keys(), ...HOTSPOTS.map(([a, b]) => regionKey(a, b))])];
+export const cachedFlights = key => cache.get(`fl:${key}`)?.v || [];
+
 export async function militaryFlights() {
   const j = await adsb('https://api.adsb.lol/v2/mil');
-  return (j.ac || []).filter(a => a.lat != null).map(a => ({ ...slimFlight(a), mil: true }));
+  const flights = (j.ac || []).filter(a => a.lat != null).map(a => ({ ...slimFlight(a), mil: true }));
+  jammingTracker.record(flights);
+  return flights;
+}
+
+// ---------- sanctions (US Treasury OFAC SDN list) ----------
+let sanctionsIndex = null;
+export async function sanctions() {
+  const csv = await getText('https://www.treasury.gov/ofac/downloads/sdn.csv');
+  const parsed = I.parseOfacCsv(csv);
+  if (parsed.ships.length < 100) throw new Error('OFAC list looks incomplete');
+  sanctionsIndex = I.buildSanctionsIndex(parsed);
+  for (const s of ships.values()) s.sanc = I.matchShip(sanctionsIndex, s); // re-check ships already known
+  return { ...sanctionsIndex.counts, imo: sanctionsIndex.imo.size, mmsi: sanctionsIndex.mmsi.size, regs: sanctionsIndex.reg.size };
+}
+
+// Sanctioned ships currently being tracked anywhere in the world.
+export async function sanctionedShips() {
+  const out = [];
+  const cutoff = Date.now() - 6 * 60 * 60 * 1000;
+  for (const s of ships.values()) if (s.sanc && s.lat != null && s.seen > cutoff) out.push({ ...s });
+  return out;
+}
+
+export const darkShips = async () => I.findDarkShips(ships.values());
+
+// ---------- satellites (CelesTrak orbital elements) ----------
+// CelesTrak updates every few hours and asks users not to download more often, so groups are
+// fetched one at a time, slowly, and the result is saved to disk for restarts.
+const SAT_GROUPS = ['stations', 'gps-ops', 'weather', 'military', 'geo', 'starlink'];
+export function parseTle(text, group) {
+  const lines = text.trim().split(/\r?\n/), out = [];
+  for (let i = 0; i + 2 < lines.length; i += 3) {
+    if (!lines[i + 1].startsWith('1 ') || !lines[i + 2].startsWith('2 ')) continue;
+    out.push({ name: lines[i].trim(), group, l1: lines[i + 1].trim(), l2: lines[i + 2].trim() });
+  }
+  return out;
+}
+
+export async function satellites() {
+  const file = join(DATA_DIR, 'satellites.json');
+  const saved = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : { time: 0, sats: [], missing: SAT_GROUPS };
+  const stale = Date.now() - saved.time > 6 * 60 * 60 * 1000;
+  // Fresh download every 6 h; in between, only retry groups that failed (at most every 10 min).
+  const missingBefore = saved.missing ?? SAT_GROUPS.filter(g => !saved.sats.some(s => s.group === g));
+  const groups = stale ? SAT_GROUPS : missingBefore.filter(() => Date.now() - (saved.tried || 0) > 10 * 60 * 1000);
+  if (!groups.length) return saved.sats;
+  const got = [], missing = [];
+  for (const group of groups) {
+    try {
+      const sats = parseTle(await getText(`https://celestrak.org/NORAD/elements/gp.php?GROUP=${group}&FORMAT=tle`), group);
+      if (sats.length) got.push(...sats); else missing.push(group);
+    } catch (err) { console.warn(`[satellites] ${group}: ${err.message}`); missing.push(group); }
+    await sleep(3000);
+  }
+  const sats = [...(stale ? [] : saved.sats.filter(s => !groups.includes(s.group))), ...got];
+  if (!sats.length) throw new Error('no satellite data');
+  mkdirSync(DATA_DIR, { recursive: true });
+  writeFileSync(file, JSON.stringify({ time: stale ? Date.now() : saved.time, tried: Date.now(), missing, sats }));
+  if (missing.length) console.warn(`[satellites] will retry: ${missing.join(', ')}`);
+  return sats;
 }
 
 // Find a live aircraft anywhere by ICAO hex, callsign or registration.
@@ -182,35 +275,10 @@ function routeAirports(cs) {
   });
 }
 
-const km = (a, b) => {
-  const r = Math.PI / 180, dLat = (b.lat - a.lat) * r, dLon = (b.lon - a.lon) * r;
-  const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * r) * Math.cos(b.lat * r) * Math.sin(dLon / 2) ** 2;
-  return 12742 * Math.asin(Math.sqrt(h));
-};
-
-const bearing = (a, b) => {
-  const r = Math.PI / 180;
-  const y = Math.sin((b.lon - a.lon) * r) * Math.cos(b.lat * r);
-  const x = Math.cos(a.lat * r) * Math.sin(b.lat * r) - Math.sin(a.lat * r) * Math.cos(b.lat * r) * Math.cos((b.lon - a.lon) * r);
-  return (Math.atan2(y, x) / r + 360) % 360;
-};
-
 export async function flightRoute(callsign, lat, lon, takeoff, track) {
   const cs = callsign.trim().toUpperCase();
   if (!/^[A-Z]{3}\d/.test(cs)) return null; // only airline-style callsigns have scheduled routes
-  const ports = await routeAirports(cs);
-  if (ports.length < 2) return null;
-  const here = { lat, lon };
-  const legs = ports.slice(0, -1).map((from, i) => ({ from, to: ports[i + 1] }));
-  // Prefer the leg starting where the plane took off; otherwise the leg it's flying along.
-  const detour = l => km(l.from, here) + km(here, l.to) - km(l.from, l.to);
-  const leg = (takeoff && legs.find(l => km(l.from, takeoff) < 25)) || legs.sort((a, b) => detour(a) - detour(b))[0];
-  const total = km(leg.from, leg.to);
-  // Heading check: once well clear of the origin, the plane should point roughly at the destination.
-  const off = Number.isFinite(track) ? Math.abs(((bearing(here, leg.to) - track + 540) % 360) - 180) : 0;
-  const headingOk = off < 100 || km(here, leg.from) < 80 || km(here, leg.to) < 80;
-  const plausible = headingOk && detour(leg) < Math.max(150, total * 0.25) && km(here, leg.to) <= total * 1.05;
-  return { ...leg, stops: ports.map(p => p.code), plausible };
+  return I.pickLeg(await routeAirports(cs), { lat, lon }, takeoff, track);
 }
 
 // Place search (OpenStreetMap Nominatim). Their rules: real User-Agent, no search-as-you-type.
@@ -228,88 +296,81 @@ export function geocode(q) {
 
 // ---------- traffic cameras, worldwide (public road-agency feeds, no keys) ----------
 // Every source returns: { name, place, route, lat, lon, image, views?, video?, videoType?, source }
-const xmlItems = (xml, tag) => xml.split(`<${tag}>`).slice(1).map(s => s.split(`</${tag}>`)[0]);
-const xmlField = (item, tag) => (item.match(new RegExp(`<${tag}>([^<]*)</${tag}>`)) || [])[1]?.trim() || '';
+export const xmlItems = (xml, tag) => xml.split(`<${tag}>`).slice(1).map(s => s.split(`</${tag}>`)[0]);
+export const xmlField = (item, tag) => (item.match(new RegExp(`<${tag}>([^<]*)</${tag}>`)) || [])[1]?.trim() || '';
 
-const CAMERA_SOURCES = {
+// Parsers turn each agency's raw format into map cameras (tested in test/feeds.test.js).
+export const CAMERA_PARSERS = {
+  California: j => (j.data || []).map(({ cctv: c }) => ({
+    name: c.location.locationName, place: c.location.nearbyPlace, route: c.location.route,
+    lat: +c.location.latitude, lon: +c.location.longitude, on: c.inService === 'true',
+    image: c.imageData?.static?.currentImageURL || '',
+    video: c.imageData?.streamingVideoURL || '', videoType: 'hls', source: 'Caltrans',
+  })),
+
+  'British Columbia': j => j.map(c => ({
+    name: c.name, place: c.region_name || 'British Columbia', route: c.highway_display ? `Hwy ${c.highway_display}` : '',
+    lat: c.location?.coordinates?.[1], lon: c.location?.coordinates?.[0], on: c.is_on !== false,
+    image: `https://www.drivebc.ca/images/${c.id}.jpg`, note: c.caption, source: 'DriveBC',
+  })),
+
+  London: j => j.map(c => {
+    const p = Object.fromEntries(c.additionalProperties.map(a => [a.key, a.value]));
+    return {
+      name: c.commonName, place: 'London', route: p.view ? `facing ${p.view}` : '',
+      lat: c.lat, lon: c.lon, on: p.available !== 'false',
+      image: p.imageUrl, video: p.videoUrl, videoType: 'mp4', source: 'Transport for London',
+    };
+  }),
+
+  'Hong Kong': xml => xmlItems(xml, 'image').map(i => ({
+    name: xmlField(i, 'description').replace(/\s*\[\w+\]$/, ''), place: `${xmlField(i, 'district')}, ${xmlField(i, 'region')}`, route: '',
+    lat: +xmlField(i, 'latitude'), lon: +xmlField(i, 'longitude'), on: true,
+    image: xmlField(i, 'url'), source: 'HK Transport Department',
+  })),
+
+  Finland: j => j.features.map(f => {
+    const [, road, place] = f.properties.name.match(/^[a-z]*(\d+)?_?(.*)$/i) || [];
+    const views = (f.properties.presets || []).filter(p => p.inCollection !== false)
+      .map(p => `https://weathercam.digitraffic.fi/${p.id}.jpg`);
+    return {
+      name: (place || f.properties.name).replace(/_/g, ' '), place: 'Finland', route: road ? `Road ${road}` : '',
+      lat: f.geometry.coordinates[1], lon: f.geometry.coordinates[0], on: f.properties.collectionStatus === 'GATHERING',
+      image: views[0], views, source: 'Fintraffic Digitraffic',
+    };
+  }),
+
+  'New Zealand': xml => xmlItems(xml, 'camera').map(i => ({
+    name: xmlField(i, 'name') || xmlField(i, 'description'), place: (i.match(/<region>.*?<name>([^<]*)<\/name>/) || [])[1] || 'New Zealand',
+    route: xmlField(i, 'highway'), note: xmlField(i, 'description'),
+    // the camera's own lat/lon come after the nested journey/region blocks
+    lat: +(i.match(/<\/journeyLeg><latitude>([^<]*)/) || [])[1], lon: +(i.match(/<\/journeyLeg><latitude>[^<]*<\/latitude><longitude>([^<]*)/) || [])[1],
+    on: xmlField(i, 'offline') !== 'true', image: `https://trafficnz.info${xmlField(i, 'imageUrl')}`, source: 'NZ Transport Agency',
+  })),
+
+  Singapore: j => (j.items?.[0]?.cameras || []).map(c => ({
+    name: `Camera ${c.camera_id}`, place: 'Singapore', route: '', lat: c.location.latitude, lon: c.location.longitude,
+    on: true, image: c.image, source: 'Singapore LTA',
+  })),
+};
+
+export const CAMERA_FETCH = {
   async California() {
     const results = await Promise.allSettled(Array.from({ length: 12 }, (_, i) => i + 1).map(d =>
       getJSON(`https://cwwp2.dot.ca.gov/data/d${d}/cctv/cctvStatusD${String(d).padStart(2, '0')}.json`)));
-    return results.filter(r => r.status === 'fulfilled').flatMap(r => (r.value.data || []).map(({ cctv: c }) => ({
-      name: c.location.locationName, place: c.location.nearbyPlace, route: c.location.route,
-      lat: +c.location.latitude, lon: +c.location.longitude, on: c.inService === 'true',
-      image: c.imageData?.static?.currentImageURL || '',
-      video: c.imageData?.streamingVideoURL || '', videoType: 'hls', source: 'Caltrans',
-    })));
+    return { data: results.filter(r => r.status === 'fulfilled').flatMap(r => r.value.data || []) };
   },
-
-  async 'British Columbia'() {
-    const j = await getJSON('https://www.drivebc.ca/api/webcams/');
-    return j.map(c => ({
-      name: c.name, place: c.region_name || 'British Columbia', route: c.highway_display ? `Hwy ${c.highway_display}` : '',
-      lat: c.location?.coordinates?.[1], lon: c.location?.coordinates?.[0], on: c.is_on !== false,
-      image: `https://www.drivebc.ca/images/${c.id}.jpg`, note: c.caption, source: 'DriveBC',
-    }));
-  },
-
-  async London() {
-    const j = await getJSON('https://api.tfl.gov.uk/Place/Type/JamCam');
-    return j.map(c => {
-      const p = Object.fromEntries(c.additionalProperties.map(a => [a.key, a.value]));
-      return {
-        name: c.commonName, place: 'London', route: p.view ? `facing ${p.view}` : '',
-        lat: c.lat, lon: c.lon, on: p.available !== 'false',
-        image: p.imageUrl, video: p.videoUrl, videoType: 'mp4', source: 'Transport for London',
-      };
-    });
-  },
-
-  async 'Hong Kong'() {
-    const xml = await getText('https://static.data.gov.hk/td/traffic-snapshot-images/code/Traffic_Camera_Locations_En.xml');
-    return xmlItems(xml, 'image').map(i => ({
-      name: xmlField(i, 'description').replace(/\s*\[\w+\]$/, ''), place: `${xmlField(i, 'district')}, ${xmlField(i, 'region')}`, route: '',
-      lat: +xmlField(i, 'latitude'), lon: +xmlField(i, 'longitude'), on: true,
-      image: xmlField(i, 'url'), source: 'HK Transport Department',
-    }));
-  },
-
-  async Finland() {
-    const j = await getJSON('https://tie.digitraffic.fi/api/weathercam/v1/stations');
-    return j.features.map(f => {
-      const [, road, place] = f.properties.name.match(/^[a-z]*(\d+)?_?(.*)$/i) || [];
-      const views = (f.properties.presets || []).filter(p => p.inCollection !== false)
-        .map(p => `https://weathercam.digitraffic.fi/${p.id}.jpg`);
-      return {
-        name: (place || f.properties.name).replace(/_/g, ' '), place: 'Finland', route: road ? `Road ${road}` : '',
-        lat: f.geometry.coordinates[1], lon: f.geometry.coordinates[0], on: f.properties.collectionStatus === 'GATHERING',
-        image: views[0], views, source: 'Fintraffic Digitraffic',
-      };
-    });
-  },
-
-  async 'New Zealand'() {
-    const xml = await getText('https://trafficnz.info/service/traffic/rest/4/cameras/all');
-    return xmlItems(xml, 'camera').map(i => ({
-      name: xmlField(i, 'name') || xmlField(i, 'description'), place: (i.match(/<region>.*?<name>([^<]*)<\/name>/) || [])[1] || 'New Zealand',
-      route: xmlField(i, 'highway'), note: xmlField(i, 'description'),
-      // the camera's own lat/lon come after the nested journey/region blocks
-      lat: +(i.match(/<\/journeyLeg><latitude>([^<]*)/) || [])[1], lon: +(i.match(/<\/journeyLeg><latitude>[^<]*<\/latitude><longitude>([^<]*)/) || [])[1],
-      on: xmlField(i, 'offline') !== 'true', image: `https://trafficnz.info${xmlField(i, 'imageUrl')}`, source: 'NZ Transport Agency',
-    }));
-  },
-
-  async Singapore() {
-    const j = await getJSON('https://api.data.gov.sg/v1/transport/traffic-images');
-    return (j.items?.[0]?.cameras || []).map(c => ({
-      name: `Camera ${c.camera_id}`, place: 'Singapore', route: '', lat: c.location.latitude, lon: c.location.longitude,
-      on: true, image: c.image, source: 'Singapore LTA',
-    }));
-  },
+  'British Columbia': () => getJSON('https://www.drivebc.ca/api/webcams/'),
+  London: () => getJSON('https://api.tfl.gov.uk/Place/Type/JamCam'),
+  'Hong Kong': () => getText('https://static.data.gov.hk/td/traffic-snapshot-images/code/Traffic_Camera_Locations_En.xml'),
+  Finland: () => getJSON('https://tie.digitraffic.fi/api/weathercam/v1/stations'),
+  'New Zealand': () => getText('https://trafficnz.info/service/traffic/rest/4/cameras/all'),
+  Singapore: () => getJSON('https://api.data.gov.sg/v1/transport/traffic-images'),
 };
 
 export async function cameras() {
-  const names = Object.keys(CAMERA_SOURCES);
-  const results = await Promise.allSettled(names.map(n => CAMERA_SOURCES[n]()));
+  const names = Object.keys(CAMERA_FETCH);
+  const results = await Promise.allSettled(names.map(async n => CAMERA_PARSERS[n](await CAMERA_FETCH[n]())));
   const cams = [];
   results.forEach((r, i) => {
     if (r.status !== 'fulfilled') { console.warn(`[cameras] ${names[i]}: ${r.reason.message}`); return; }
@@ -334,45 +395,13 @@ function unzipFirst(buf) {
   return zlib.inflateRawSync(buf.subarray(30 + nameLen + extraLen)).toString();
 }
 
-function titleFromUrl(url) {
-  try {
-    const u = new URL(url);
-    const parts = u.pathname.split('/').filter(Boolean)
-      .map(p => decodeURIComponent(p).replace(/\.(s?html?|php|aspx?)$/i, ''));
-    const slug = parts.reverse().find(p => /[a-z]{3,}[-_][a-z]{3,}/i.test(p)) || '';
-    const words = slug.replace(/[-_+]+/g, ' ').replace(/\b[\da-f]{6,}\b|\b\d+\b/gi, '').replace(/\s+/g, ' ').trim();
-    return words.length > 12 ? words[0].toUpperCase() + words.slice(1) : u.host.replace(/^www\./, '');
-  } catch { return url; }
-}
-
-function category(root) {
-  if (root >= 18) return 'violence';       // assault, fight, mass violence
-  if (root === 14) return 'protest';
-  if (root >= 13) return 'tension';        // threaten, protest, posture, sanction, coerce
-  return 'other';
-}
-
 async function loadNewsFile(stamp) {
   if (fetchedFiles.has(stamp)) return;
   const r = await fetch(`http://data.gdeltproject.org/gdeltv2/${stamp}.export.CSV.zip`, { headers: UA });
   if (!r.ok) return;
   fetchedFiles.add(stamp);
   const time = Date.UTC(+stamp.slice(0, 4), +stamp.slice(4, 6) - 1, +stamp.slice(6, 8), +stamp.slice(8, 10), +stamp.slice(10, 12));
-  for (const line of unzipFirst(Buffer.from(await r.arrayBuffer())).split('\n')) {
-    const c = line.split('\t');
-    const lat = +c[56], lon = +c[57], url = c[60];
-    if (!url || !lat || !lon) continue;
-    // One article yields many machine-coded events; its category is the one most of them agree on.
-    const mentions = +c[31] || 1, cat = category(+c[28]);
-    let s = stories.get(url);
-    if (!s) {
-      s = { url, title: titleFromUrl(url), domain: new URL(url).host.replace(/^www\./, ''), votes: {}, mentions: 0, time };
-      stories.set(url, s);
-    }
-    s.votes[cat] = (s.votes[cat] || 0) + 1;
-    s.cat = Object.entries(s.votes).sort((a, b) => b[1] - a[1] || (b[0] === 'other') - (a[0] === 'other'))[0][0];
-    if (mentions > s.mentions) Object.assign(s, { place: c[52], lat: round(lat, 3), lon: round(lon, 3), tone: round(+c[34], 1), mentions });
-  }
+  for (const line of unzipFirst(Buffer.from(await r.arrayBuffer())).split('\n')) I.addGdeltRow(stories, line, time);
 }
 
 const stampOf = d => d.toISOString().replace(/\D/g, '').slice(0, 12) + '00';
@@ -485,19 +514,6 @@ export async function powerPlants() {
   return out; // compact rows: [lon, lat, fuel, mw, name, country]
 }
 
-function parseCsvLine(line) {
-  const out = []; let cur = '', q = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (q) { if (ch === '"') { if (line[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += ch; }
-    else if (ch === '"') q = true;
-    else if (ch === ',') { out.push(cur); cur = ''; }
-    else cur += ch;
-  }
-  out.push(cur);
-  return out;
-}
-
 // ---------- ships (aisstream.io websocket, free key) ----------
 const ships = new Map();
 export const ais = { status: 'no-key', total: () => ships.size };
@@ -525,8 +541,9 @@ export function connectAIS(key) {
     if (pos) Object.assign(s, { lat: meta.latitude, lon: meta.longitude, speed: pos.Sog, course: pos.Cog,
       heading: pos.TrueHeading === 511 ? pos.Cog : pos.TrueHeading, seen: Date.now() });
     const st = m.Message?.ShipStaticData;
-    if (st) Object.assign(s, { type: st.Type, dest: (st.Destination || '').trim(), imo: st.ImoNumber,
+    if (st) Object.assign(s, { type: st.Type, dest: (st.Destination || '').trim(), imo: st.ImoNumber || undefined,
       length: (st.Dimension?.A || 0) + (st.Dimension?.B || 0) });
+    if (st || !ships.has(id)) s.sanc = I.matchShip(sanctionsIndex, s);
     ships.set(id, s);
   };
   ws.onclose = ev => {
@@ -535,8 +552,9 @@ export function connectAIS(key) {
     setTimeout(() => connectAIS(key), 5000);
   };
   ws.onerror = () => {};
+  // Ships are kept for 6 h after their last report so silent ("dark") ones can still be shown.
   pruneShips ||= setInterval(() => {
-    const cutoff = Date.now() - 30 * 60 * 1000;
+    const cutoff = Date.now() - 6 * 60 * 60 * 1000;
     for (const [id, s] of ships) if (!s.seen || s.seen < cutoff) ships.delete(id);
   }, 60000).unref();
 }
@@ -547,8 +565,9 @@ export const allShips = () => ships.values();
 
 export function shipsIn([w, s, e, n]) {
   const out = [];
+  const fresh = Date.now() - 30 * 60 * 1000; // the live layer only shows ships heard in the last 30 min
   for (const sh of ships.values()) {
-    if (sh.lat == null || sh.lat < s || sh.lat > n) continue;
+    if (sh.lat == null || sh.lat < s || sh.lat > n || sh.seen < fresh) continue;
     if (w <= e ? (sh.lon < w || sh.lon > e) : (sh.lon < w && sh.lon > e)) continue;
     out.push(sh);
     if (out.length >= 20000) break;

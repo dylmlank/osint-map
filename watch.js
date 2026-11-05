@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import * as F from './feeds.js';
+import { inBox } from './intel.js';
 
 const MIN = 60 * 1000;
 const EMERGENCY = { 7500: 'hijack', 7600: 'radio failure', 7700: 'general emergency' };
@@ -15,6 +16,7 @@ export const AREA_RULES = {
   fire: 'New US wildfire',
   events: 'New natural disaster',
   shipsDark: 'Moving ship stops transmitting',
+  sanctioned: 'Sanctioned ship or plane is in the area',
   news: 'News tagged violence',
 };
 
@@ -40,13 +42,7 @@ export function createWatch({ dir, feeds, broadcast }) {
     broadcast('alert', JSON.stringify(full));
   }
 
-  // Area check that also handles boxes crossing the date line. No bbox = whole world.
-  const inArea = (item, lat, lon) => {
-    if (!item.bbox) return true;
-    const [w, s, e, n] = item.bbox;
-    if (lat < s || lat > n) return false;
-    return w <= e ? lon >= w && lon <= e : lon >= w || lon <= e;
-  };
+  const inArea = (item, lat, lon) => inBox(item.bbox, lat, lon);
   const name = f => f.call || f.reg || f.hex?.toUpperCase();
   const alt = f => (f.alt === 'ground' ? 'on the ground' : `${Number(f.alt).toLocaleString()} ft`);
 
@@ -141,13 +137,25 @@ export function createWatch({ dir, feeds, broadcast }) {
       if (fresh('event', e.title)) alert(item, { kind: 'event', title: `${e.cat} in ${item.label}`, detail: e.title, lat: e.lat, lon: e.lon });
     }
     if (r.shipsDark) {
-      const now = Date.now();
-      for (const s of F.allShips()) {
-        if (s.lat == null || !inArea(item, s.lat, s.lon) || (s.speed || 0) < 2) continue;
-        const quiet = now - (s.seen || now);
-        if (quiet > 15 * MIN && quiet < 30 * MIN && fresh('dark', s.mmsi, 6 * 60 * MIN)) {
-          alert(item, { kind: 'dark', title: `${s.name || `MMSI ${s.mmsi}`} stopped transmitting in ${item.label}`, detail: `Was moving at ${s.speed} kt, silent for ${Math.round(quiet / MIN)} min. Could be AIS switched off, or out of receiver range.`, lat: s.lat, lon: s.lon });
+      for (const s of feeds.dark?.data || []) {
+        if (!inArea(item, s.lat, s.lon)) continue;
+        if (fresh('dark', s.mmsi, 6 * 60 * MIN)) {
+          alert(item, { kind: 'dark', title: `${s.name || `MMSI ${s.mmsi}`} stopped transmitting in ${item.label}`,
+            detail: `Was moving at ${s.speed} kt, silent for ${s.silentMin} min. ${s.confidence === 'high' ? 'Ships nearby are still being heard, so it likely switched AIS off.' : 'No other ships heard nearby, so it may just be out of receiver range.'}`,
+            lat: s.lat, lon: s.lon });
         }
+      }
+    }
+    if (r.sanctioned) {
+      for (const s of feeds.sanctioned?.data || []) {
+        if (!inArea(item, s.lat, s.lon)) continue;
+        counts.sanctioned = (counts.sanctioned || 0) + 1;
+        if (fresh('sanc', `ship:${s.mmsi}`, 12 * 60 * MIN)) alert(item, { kind: 'sanctioned', title: `Sanctioned ship in ${item.label}: ${s.name || `MMSI ${s.mmsi}`}`, detail: `${s.sanc.programs.join(', ')} · matched by ${s.sanc.by}`, lat: s.lat, lon: s.lon, ref: { type: 'ship', id: s.mmsi } });
+      }
+      const planes = [...(feeds.military?.data || []), ...F.knownRegions().flatMap(F.cachedFlights)];
+      for (const f of planes) {
+        if (!f.sanc || !inArea(item, f.lat, f.lon)) continue;
+        if (fresh('sanc', `plane:${f.hex}`, 12 * 60 * MIN)) alert(item, { kind: 'sanctioned', title: `Sanctioned aircraft in ${item.label}: ${name(f)}`, detail: `${f.sanc.model || f.type} · ${f.sanc.operator || f.sanc.name} · ${f.sanc.programs.join(', ')}`, lat: f.lat, lon: f.lon, ref: { type: 'flight', id: f.hex } });
       }
     }
     if (r.news) {

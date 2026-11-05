@@ -6,8 +6,9 @@ const C = {
   planeLow: '#38bdf8', planeMid: '#7dd3fc', planeHigh: '#e0f2fe', planeGround: '#64748b',
   military: '#f59e0b', emergency: '#ff1744',
   camera: '#e879f9', fire: '#f97316', alert: '#f472b6', radar: '#60a5fa', cable: '#2dd4bf',
-  track: '#22d3ee',
+  track: '#22d3ee', sanction: '#ff1744', dark: '#fbbf24', darkLow: '#a8a29e',
 };
+const SAT = { stations: '#fde047', 'gps-ops': '#4ade80', weather: '#60a5fa', military: '#ef4444', geo: '#c084fc', starlink: '#94a3b8' };
 const SHIP = { Cargo: '#4ade80', Tanker: '#fb7185', Passenger: '#c084fc', Fishing: '#facc15', Service: '#fdba74', Other: '#94a3b8' };
 const NEWS = { violence: '#ef4444', protest: '#fb923c', tension: '#facc15', other: '#94a3b8' };
 const QUAKE = [[6, '#dc2626'], [4.5, '#f97316'], [2.5, '#facc15'], [-9, '#d9f99d']];
@@ -37,12 +38,18 @@ const LAYERS = [
   { id: 'radar',    group: 'World events',   label: 'Rain radar',           icon: ['drop', C.radar],      kind: 'raster' },
   { id: 'cables',   group: 'Infrastructure', label: 'Undersea cables',      icon: ['diamond', C.cable],   kind: 'feed' },
   { id: 'plants',   group: 'Infrastructure', label: 'Power plants',         icon: ['bolt', FUEL.Solar],   kind: 'feed' },
+  { id: 'sanctioned', group: 'Intelligence', label: 'Sanctioned ships (world)', icon: ['ship', C.sanction], kind: 'feed' },
+  { id: 'dark',       group: 'Intelligence', label: 'Ships gone silent',    icon: ['ship', C.dark],       kind: 'feed' },
+  { id: 'jamming',    group: 'Intelligence', label: 'GPS jamming (last hour)', icon: ['grid', '#ef4444'], kind: 'feed' },
+  { id: 'satellites', group: 'Space',        label: 'Satellites',           icon: ['satellite', '#fde047'], kind: 'sat' },
+  { id: 'starlink',   group: 'Space',        label: 'Starlink',             icon: ['satellite', '#94a3b8'], kind: 'sat' },
 ];
 
 // How often each layer normally refreshes (seconds). The panel's timer turns amber past 3× this.
 const EVERY = {
   flights: 8, military: 15, ships: 5, cameras: 600, news: 900, quakes: 60, events: 900,
   fires: 300, alerts: 120, radar: 600, cables: 86400, plants: 86400,
+  sanctioned: 60, dark: 60, jamming: 60, satellites: 21600, starlink: 21600,
 };
 
 const LEGEND = [
@@ -59,6 +66,11 @@ const LEGEND = [
   ['bolt', FUEL.Gas, 'Gas'], ['bolt', FUEL.Hydro, 'Hydro'],
   ['bolt', FUEL.Wind, 'Wind'], ['bolt', FUEL.Solar, 'Solar'],
   ['airport', '#22d3ee', 'Departure'], ['airport', '#f472b6', 'Destination'],
+  ['ship', C.sanction, 'Sanctioned (red ring)'], ['ship', C.dark, 'Silent, likely switched off'],
+  ['ship', C.darkLow, 'Silent, maybe out of range'], ['grid', '#ef4444', 'GPS jamming 10%+'],
+  ['grid', '#facc15', 'GPS jamming 5–10%'], ['satellite', SAT.stations, 'Space station'],
+  ['satellite', SAT['gps-ops'], 'GPS'], ['satellite', SAT.weather, 'Weather'],
+  ['satellite', SAT.military, 'Military sat'], ['satellite', SAT.geo, 'Geostationary'],
 ];
 
 const store = {
@@ -99,7 +111,7 @@ if (!BASEMAPS[basemap]) basemap = 'dark';
 const view = store.get('osint-view', { center: [-118.3, 34.0], zoom: 7 });
 const map = new maplibregl.Map({
   container: 'map', style: BASEMAPS[basemap],
-  center: view.center, zoom: view.zoom, attributionControl: { compact: true },
+  center: view.center, zoom: view.zoom, attributionControl: { compact: true }, maxPitch: 80,
 });
 map.addControl(new maplibregl.NavigationControl(), 'bottom-right');
 const overlay = new MapboxOverlay({ layers: [], getTooltip: tooltip });
@@ -120,8 +132,79 @@ basemapButtons.forEach(b => b.addEventListener('click', () => {
   styleReady = new Promise(r => map.once('style.load', r));
   map.setStyle(BASEMAPS[basemap]);
 }));
-// A new style drops our raster radar, so put it back whenever a style finishes loading.
-map.on('style.load', () => { if (on.radar) setRadar(); });
+// A new style drops our radar and 3D layers, so put them back whenever a style finishes loading.
+map.on('style.load', () => { if (on.radar) setRadar(); if (is3D) add3D(); });
+
+// ---------- 3D: real terrain (AWS elevation tiles) + building heights (OpenFreeMap) ----------
+// Right-click toggles it; tilting with right-drag turns it on automatically.
+let is3D = store.get('osint-3d', false);
+const button3D = document.getElementById('toggle-3d');
+
+function add3D() {
+  if (!map.getSource('terrain-dem')) {
+    map.addSource('terrain-dem', {
+      type: 'raster-dem', encoding: 'terrarium', tileSize: 256, maxzoom: 14,
+      tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],
+      attribution: 'Elevation: Mapzen / AWS Terrain Tiles',
+    });
+  }
+  map.setTerrain({ source: 'terrain-dem', exaggeration: 1.4 });
+  if (basemap === 'dark' && !map.getLayer('hillshade')) {
+    // Shade slopes so mountains read on the dark map (satellite imagery is already shaded).
+    const firstLabel = map.getStyle().layers.find(l => l.type === 'symbol')?.id;
+    map.addLayer({ id: 'hillshade', type: 'hillshade', source: 'terrain-dem',
+      paint: { 'hillshade-exaggeration': 0.5, 'hillshade-shadow-color': '#000000', 'hillshade-highlight-color': '#3b4757' } }, firstLabel);
+  }
+  if (!map.getSource('ofm')) map.addSource('ofm', { type: 'vector', url: 'https://tiles.openfreemap.org/planet', attribution: 'Buildings: OpenFreeMap, OpenStreetMap' });
+  if (!map.getLayer('buildings-3d')) {
+    map.addLayer({
+      id: 'buildings-3d', type: 'fill-extrusion', source: 'ofm', 'source-layer': 'building', minzoom: 13,
+      paint: {
+        'fill-extrusion-color': basemap === 'dark' ? '#2c3a4b' : '#e7e2d8',
+        'fill-extrusion-height': ['coalesce', ['get', 'render_height'], 8],
+        'fill-extrusion-base': ['coalesce', ['get', 'render_min_height'], 0],
+        'fill-extrusion-opacity': 0.85,
+      },
+    });
+  }
+}
+
+function remove3D() {
+  map.setTerrain(null);
+  for (const id of ['buildings-3d', 'hillshade']) if (map.getLayer(id)) map.removeLayer(id);
+}
+
+async function set3D(onOff, { tilt = true } = {}) {
+  is3D = onOff;
+  store.set('osint-3d', is3D);
+  button3D.setAttribute('aria-pressed', String(is3D));
+  await styleReady;
+  if (is3D) {
+    add3D();
+    if (tilt) {
+      if (map.getPitch() < 30) map.easeTo({ pitch: 65, duration: 1200 });
+      toast({ kind: 'info', title: '3D on', detail: 'Right-drag (or Ctrl + drag) to tilt and turn. Zoom in close to see buildings. Right-click again to go back to flat.' }, 6000);
+    }
+  } else {
+    remove3D();
+    map.easeTo({ pitch: 0, bearing: 0, duration: 800 });
+  }
+}
+
+button3D.addEventListener('click', () => set3D(!is3D));
+button3D.setAttribute('aria-pressed', String(is3D));
+if (is3D) set3D(true, { tilt: false });
+
+// A right-click without dragging toggles 3D (a right-drag just tilts/rotates as usual).
+let rightDown = null;
+map.on('mousedown', e => { if (e.originalEvent.button === 2) rightDown = e.point; });
+map.on('contextmenu', e => {
+  e.originalEvent.preventDefault();
+  const moved = rightDown && Math.hypot(e.point.x - rightDown.x, e.point.y - rightDown.y) > 5;
+  rightDown = null;
+  if (!moved) set3D(!is3D);
+});
+map.on('pitchend', () => { if (!is3D && map.getPitch() > 25) set3D(true, { tilt: false }); });
 
 // ---------- panel ----------
 const panel = document.getElementById('layers');
@@ -147,6 +230,7 @@ panel.addEventListener('change', e => {
   const l = LAYERS.find(x => x.id === id);
   if (on[id] && l.kind === 'feed' && !data[id]) loadFeed(id);
   if (l.kind === 'raster') setRadar();
+  if (l.kind === 'sat') { if (on[id]) loadSatellites(); else data[id] = null; }
   if (on[id] && !data[id] && l.kind !== 'raster') setCount(id, '…');
   if (!on[id]) setCount(id, '');
   sendView();
@@ -155,7 +239,9 @@ panel.addEventListener('change', e => {
 
 function setCount(id, n) {
   const el = document.getElementById(`n-${id}`);
-  el.textContent = typeof n === 'number' ? n.toLocaleString() : n;
+  const text = typeof n === 'number' ? n.toLocaleString() : n;
+  if (el.textContent === text) return; // only flash when the number actually changes
+  el.textContent = text;
   el.className = typeof n === 'number' ? '' : 'loading';
   if (typeof n === 'number') {
     const row = document.getElementById(`row-${id}`);
@@ -174,13 +260,14 @@ const COUNT = {
   news: d => d.reduce((s, p) => s + p.n, 0),
   alerts: d => d.features.length,
   cables: d => d.features.length,
+  jamming: d => d.filter(c => c.level === 'high').length, // areas with strong signs of jamming
 };
 
 function accept(id, json) {
   data[id] = json;
   received[id] = performance.now();
   if (LAYERS.find(l => l.id === id)?.kind === 'push') updatedAt[id] = Date.now();
-  setCount(id, (COUNT[id] || (d => d.length))(json));
+  if (!replay.active) setCount(id, (COUNT[id] || (d => d.length))(json)); // replay shows its own counts
   if (id === 'flights' || id === 'military') updateTracked(json);
   render();
 }
@@ -219,6 +306,7 @@ function connect() {
   es.addEventListener('checked', e => {
     const j = JSON.parse(e.data), offset = Date.now() - j.now;
     for (const [id, t] of Object.entries(j.feeds)) if (t) updatedAt[id] = t + offset;
+    if (updatedAt.satellites) updatedAt.starlink = updatedAt.satellites; // same orbit download
     showAges();
   });
   es.addEventListener('watch', e => { watchItems = JSON.parse(e.data); renderWatch(); render(); });
@@ -271,6 +359,36 @@ function shipColor(s) {
 }
 
 const quakeColor = q => QUAKE.find(([m]) => q.mag >= m)[1];
+
+function jamColor(level, fill) {
+  const c = level === 'high' ? [239, 68, 68] : level === 'medium' ? [250, 204, 21] : [34, 197, 94];
+  return [...c, fill ? (level === 'high' ? 110 : level === 'medium' ? 80 : 22) : (level === 'normal' ? 50 : 200)];
+}
+
+// Dead-reckon a silent ship: last position moved along its course at its last speed.
+function projectShip(d) {
+  const hours = Math.min(d.silentMin, 360) / 60;
+  const nm = (d.speed || 0) * hours, rad = (d.course || 0) * Math.PI / 180;
+  return [d.lon + (nm / 60) * Math.sin(rad) / Math.cos(d.lat * Math.PI / 180), d.lat + (nm / 60) * Math.cos(rad)];
+}
+
+// Red ring around anything matched to the sanctions list, on any layer.
+function sanctionRings() {
+  const hits = [];
+  for (const id of ['flights', 'military', 'ships', 'dark', 'sanctioned']) if (on[id]) for (const d of V[id] || []) if (d.sanc) hits.push(d);
+  return new ScatterplotLayer({
+    id: 'sanction-rings', data: hits, getPosition: d => [d.lon, d.lat], radiusUnits: 'pixels', getRadius: 15,
+    stroked: true, filled: false, getLineColor: [...rgb(C.sanction), 230], lineWidthMinPixels: 2,
+  });
+}
+
+function sanctionBlock(s) {
+  if (!s) return '';
+  return `<div class="route sanc"><b>Sanctioned (US OFAC)</b>
+    <small>Listed as ${esc(s.name)} · programs: ${esc(s.programs.join(', '))}</small>
+    ${s.owner ? `<small>Owner: ${esc(s.owner)}</small>` : ''}${s.operator ? `<small>Operator: ${esc(s.operator)}</small>` : ''}
+    <small>Matched by ${esc(s.by)}${s.by === 'MMSI' ? '. MMSI numbers get reused or faked, so treat this as a lead to check' : ''}</small></div>`;
+}
 const eventIcon = e => EVENT[e.cat] || EVENT_OTHER;
 
 // ---------- smooth plane motion ----------
@@ -293,7 +411,7 @@ requestAnimationFrame(animate);
 // ---------- layers ----------
 function icons(id, { shape, color, size, angle, ...extra }) {
   return new IconLayer({
-    id, data: data[id], pickable: true,
+    id, data: V[id], pickable: true,
     getPosition: d => [d.lon, d.lat],
     getIcon: typeof shape === 'function'
       ? d => Icons.icon(shape(d), color(d))
@@ -311,23 +429,31 @@ function planes(id) {
     shape: 'plane', color: planeColor,
     size: d => (d.mil || d.emergency ? 24 : 20),
     angle: d => -(d.track || 0),
-    getPosition: d => movedPosition(d, performance.now() - t0),
-    onClick: ({ object }) => openFlight(object),
+    getPosition: d => (replay.active ? [d.lon, d.lat] : movedPosition(d, performance.now() - t0)),
+    onClick: ({ object }) => (replay.active ? select('replayFlight', object) : openFlight(object)),
     updateTriggers: { getPosition: tick },
   });
 }
 
 function render() {
   const L = [];
-  const show = id => on[id] && data[id];
+  V = currentView();
+  const show = id => on[id] && V[id];
   if (show('alerts')) L.push(new GeoJsonLayer({
-    id: 'alerts', data: data.alerts, pickable: true, stroked: true, filled: true,
+    id: 'alerts', data: V.alerts, pickable: true, stroked: true, filled: true,
     getFillColor: f => [...(ALERT[f.properties.severity] || [148, 163, 184]), 55],
     getLineColor: f => [...(ALERT[f.properties.severity] || [148, 163, 184]), 220], lineWidthMinPixels: 1.5,
     onClick: ({ object }) => select('alerts', object),
   }));
+  if (show('jamming')) L.push(new GeoJsonLayer({
+    id: 'jamming', pickable: true, stroked: true, filled: true, lineWidthMinPixels: 1,
+    data: { type: 'FeatureCollection', features: V.jamming.map(c => ({ type: 'Feature', properties: c,
+      geometry: { type: 'Polygon', coordinates: [boxPolygon([c.lon, c.lat, c.lon + c.size, c.lat + c.size])] } })) },
+    getFillColor: f => jamColor(f.properties.level, true), getLineColor: f => jamColor(f.properties.level, false),
+    onClick: ({ object }) => select('jamming', object.properties),
+  }));
   if (show('cables')) L.push(new GeoJsonLayer({
-    id: 'cables', data: data.cables, pickable: true, lineWidthMinPixels: 1.5,
+    id: 'cables', data: V.cables, pickable: true, lineWidthMinPixels: 1.5,
     getLineColor: f => [...rgb(f.properties.color || C.cable), 180],
     onClick: ({ object }) => select('cables', object),
   }));
@@ -344,11 +470,38 @@ function render() {
   if (show('ships')) L.push(icons('ships', {
     shape: 'ship', color: shipColor, size: 15, angle: d => -(d.heading ?? d.course ?? 0),
   }));
+  if (show('dark')) {
+    // Where each silent ship would be now if it kept its last course and speed.
+    L.push(new PathLayer({
+      id: 'dark-projection', data: V.dark, widthUnits: 'pixels', getWidth: 1.5,
+      getPath: d => [[d.lon, d.lat], projectShip(d)], getColor: d => [...rgb(d.confidence === 'high' ? C.dark : C.darkLow), 150],
+    }));
+    L.push(icons('dark', {
+      shape: 'ship', color: d => (d.confidence === 'high' ? C.dark : C.darkLow), size: 18, angle: d => -(d.course || 0),
+    }));
+  }
+  if (show('sanctioned')) L.push(icons('sanctioned', {
+    shape: 'ship', color: C.sanction, size: 20, angle: d => -(d.heading ?? d.course ?? 0),
+  }));
+  L.push(sanctionRings());
+  if (show('satellites')) L.push(icons('satellites', {
+    shape: 'satellite', color: d => SAT[d.group] || '#e2e8f0', size: d => (d.iss ? 28 : d.group === 'stations' ? 20 : 14),
+    updateTriggers: { getPosition: satTick },
+  }));
+  if (show('starlink')) L.push(new ScatterplotLayer({
+    id: 'starlink', data: V.starlink, pickable: true, radiusUnits: 'pixels', getRadius: 2,
+    getPosition: d => [d.lon, d.lat], getFillColor: [...rgb(SAT.starlink), 200],
+    onClick: ({ object }) => select('starlink', object), updateTriggers: { getPosition: satTick },
+  }));
+  if (selectedSat) L.push(new PathLayer({
+    id: 'sat-track', data: selectedSat.track, getPath: d => d, widthUnits: 'pixels', getWidth: 2,
+    getColor: [...rgb(SAT[selectedSat.group] || '#e2e8f0'), 200],
+  }));
   L.push(...areaLayers());
-  L.push(...routeLayers());
+  if (!replay.active) L.push(...routeLayers());
   if (show('flights')) L.push(planes('flights'));
   if (show('military')) L.push(planes('military'));
-  if (tracked) L.push(...trackedPlaneLayers());
+  if (tracked && !replay.active) L.push(...trackedPlaneLayers());
   overlay.setProps({ layers: L });
 }
 
@@ -365,6 +518,11 @@ function tooltip({ object, layer }) {
     : id === 'cables' ? object.properties.name
     : id === 'plants' ? `${object[4]} · ${object[2]} ${object[3]} MW`
     : id === 'airports' ? `${object.label}: ${object.code} · ${object.name}`
+    : id === 'sanctioned' ? `SANCTIONED: ${object.name || `MMSI ${object.mmsi}`}`
+    : id === 'dark' ? `${object.name || `MMSI ${object.mmsi}`} · silent ${object.silentMin} min`
+    : id === 'jamming' ? `${object.properties.pct}% of ${object.properties.n} aircraft with poor GPS`
+    : id === 'satellites' || id === 'starlink' ? `${object.name} · ${Math.round(object.alt).toLocaleString()} km up`
+    : id === 'sanction-rings' || id === 'dark-projection' || id === 'sat-track' ? null
     : id === 'watch-areas' ? (object.properties.draft ? null : `Watching: ${object.properties.label}`)
     : id.startsWith('route') ? null
     : (object.call || object.reg || object.hex);
@@ -550,6 +708,7 @@ function showFlightCard() {
   }
   openCard('flight', `<h2>${esc(d.call || d.reg || d.hex)}${d.mil ? '<span class="flag mil">MILITARY</span>' : ''}${d.emergency ? '<span class="flag emg">EMERGENCY</span>' : ''}</h2>
     <div class="sub">${esc(trace?.desc || d.type)}${trace?.operator ? ` · ${esc(trace.operator)}` : ''} · ICAO ${esc(d.hex)}</div>
+    ${sanctionBlock(d.sanc)}
     ${routeHtml}
     ${rows([['Registration', d.reg], ['Altitude', d.alt === 'ground' ? 'on ground' : d.alt != null ? `${d.alt.toLocaleString()} ft` : ''],
       ['Speed', d.speed != null ? `${Math.round(d.speed)} kt` : ''], ['Heading', `${Math.round(d.track)}°`], ['Squawk', d.squawk], ['Position', pos2(d.lat, d.lon)]])}
@@ -604,8 +763,9 @@ const ago = t => {
 const pos2 = (lat, lon) => `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
 
 const CARDS = {
-  ships: d => `<h2>${esc(d.name || 'Unknown vessel')}</h2>
+  ships: d => `<h2>${esc(d.name || 'Unknown vessel')}${d.sanc ? '<span class="flag emg">SANCTIONED</span>' : ''}</h2>
     <div class="sub">MMSI ${esc(d.mmsi)}${d.imo ? ` · IMO ${esc(d.imo)}` : ''}</div>
+    ${sanctionBlock(d.sanc)}
     ${rows([['Type', shipType(d.type)], ['Destination', d.dest], ['Length', d.length ? `${d.length} m` : ''],
       ['Speed', d.speed != null ? `${d.speed} kt` : ''], ['Course', d.course != null ? `${Math.round(d.course)}°` : ''],
       ['Last heard', d.seen ? ago(d.seen) : ''], ['Position', pos2(d.lat, d.lon)]])}
@@ -650,15 +810,44 @@ const CARDS = {
     <div class="sub">Undersea internet cable · TeleGeography</div>
     ${link(`https://www.submarinecablemap.com/submarine-cable/${d.properties.id}`, 'Landing points and owners')}`,
 
+  dark: d => `<h2>${esc(d.name || `MMSI ${d.mmsi}`)}${d.sanc ? '<span class="flag emg">SANCTIONED</span>' : ''}</h2>
+    <div class="sub">Silent for ${d.silentMin} min · MMSI ${esc(d.mmsi)}${d.imo ? ` · IMO ${esc(d.imo)}` : ''}</div>
+    <div class="route"><small>${d.confidence === 'high'
+      ? `<b>Likely switched off.</b> ${d.neighbors} other ships nearby are still being heard, so a gap in receiver coverage is unlikely.`
+      : '<b>Maybe just out of range.</b> No other ships nearby are being heard either, so this may be a gap in receiver coverage.'}</small>
+      <small>The line shows where it would be now if it kept going at ${d.speed} kt on its last course.</small></div>
+    ${sanctionBlock(d.sanc)}
+    ${rows([['Type', shipType(d.type)], ['Destination', d.dest], ['Last speed', `${d.speed} kt`], ['Last course', `${Math.round(d.course || 0)}°`],
+      ['Last heard', ago(d.lastSeen)], ['Last position', pos2(d.lat, d.lon)]])}`,
+
+  jamming: d => `<h2>GPS ${d.level === 'high' ? 'jamming likely' : d.level === 'medium' ? 'interference possible' : 'looks normal'}</h2>
+    <div class="sub">${d.lat}…${d.lat + d.size}°, ${d.lon}…${d.lon + d.size}° · last hour</div>
+    <p><b>${d.bad}</b> of <b>${d.n}</b> aircraft (${d.pct}%) reported poor GPS accuracy here.</p>
+    <p class="sub">Planes broadcast how sure they are of their GPS position. When many in one area report poor accuracy at once, the usual cause is jamming or spoofing. This only covers areas the server has sampled: the ones you've viewed plus known hotspots (Baltic, Black Sea, Eastern Mediterranean, Middle East, Korea).</p>`,
+
+  satellites: d => satCard(d),
+  starlink: d => satCard(d),
+
   plants: d => `<h2>${esc(d[4])}</h2>
     <div class="sub">${esc(d[5])} · WRI power plant database</div>
     ${rows([['Fuel', d[2]], ['Capacity', `${d[3].toLocaleString()} MW`], ['Position', pos2(d[1], d[0])]])}`,
 };
 
 function select(kind, d) {
+  if (kind === 'sanctioned') kind = 'ships'; // same card as any ship
   if (!d || !CARDS[kind]) return;
+  if (selectedSat && kind !== 'satellites' && kind !== 'starlink') selectedSat = null;
+  if (kind === 'satellites' || kind === 'starlink') selectSat(d);
   openCard(kind, CARDS[kind](d));
-  if (kind === 'ships') {
+  if (kind === 'replayFlight') {
+    document.getElementById('replay-track').onclick = async () => {
+      goLive();
+      const hit = (await fetch(`/api/find?q=${d.hex}`).then(r => (r.ok ? r.json() : [])).catch(() => []))[0];
+      if (hit) openFlight(hit, { fly: true });
+      else toast({ kind: 'info', title: `${d.call || d.hex} isn't broadcasting right now`, detail: 'It may have landed or be out of receiver range.' });
+    };
+  }
+  if (kind === 'ships' && document.getElementById('watch-toggle')) {
     document.getElementById('watch-toggle').onclick = async () => {
       await toggleWatch(findWatch('ship', d.mmsi), { type: 'ship', mmsi: d.mmsi, label: d.name || `MMSI ${d.mmsi}` });
       select('ships', d);
@@ -1005,6 +1194,7 @@ function onAlert(a) {
   alerts.unshift(a);
   alerts = alerts.slice(0, 300);
   renderWatch();
+  drawTicks();
   toast(a);
   notify(a);
   if (cardKind === 'alerts') showAlerts();
@@ -1079,6 +1269,271 @@ async function goTo(a) {
   }
 }
 
+// ---------- satellites ----------
+// The server hands over orbit data (TLEs) every few hours; positions are worked out here
+// every second with the standard SGP4 model (satellite.js).
+const SAT_GROUP = { stations: 'Space station', 'gps-ops': 'GPS', weather: 'Weather', military: 'Military', geo: 'Geostationary', starlink: 'Starlink' };
+let satRecs = null, satLoading = null, satTick = 0, selectedSat = null;
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = Object.assign(document.createElement('script'), { src, onload: resolve, onerror: reject });
+    document.head.append(s);
+  });
+}
+
+async function loadSatellites(attempt = 0) {
+  satLoading ||= (async () => {
+    if (!window.satellite) await loadScript('https://unpkg.com/satellite.js@5.0.0/dist/satellite.min.js');
+    const r = await fetch('/api/satellites');
+    if (!r.ok) throw new Error(r.status);
+    satRecs = (await r.json()).map(s => ({
+      name: s.name, group: s.group, id: s.l1.slice(2, 7).trim(), iss: s.name.startsWith('ISS (ZARYA)'),
+      satrec: satellite.twoline2satrec(s.l1, s.l2),
+      incl: +s.l2.slice(8, 16), period: 1440 / +s.l2.slice(52, 63),
+    }));
+    setStatus('sats', '');
+  })();
+  try { await satLoading; updateSats(); }
+  catch {
+    satLoading = null;
+    setStatus('sats', attempt > 1 ? 'Satellite data not ready yet, retrying' : '');
+    setTimeout(() => (on.satellites || on.starlink) && loadSatellites(attempt + 1), 5000);
+  }
+}
+
+function satPosition(rec, date) {
+  const pv = satellite.propagate(rec.satrec, date);
+  if (!pv.position) return null;
+  const g = satellite.eciToGeodetic(pv.position, satellite.gstime(date));
+  const v = pv.velocity;
+  return { lat: satellite.degreesLat(g.latitude), lon: satellite.degreesLong(g.longitude), alt: g.height, speed: Math.hypot(v.x, v.y, v.z) };
+}
+
+const satNow = () => new Date(replay.active ? replay.time : Date.now());
+
+function updateSats() {
+  if (!satRecs || (!on.satellites && !on.starlink)) return;
+  const now = satNow();
+  const sats = [], stars = [];
+  for (const rec of satRecs) {
+    const star = rec.group === 'starlink';
+    if (!(star ? on.starlink : on.satellites)) continue;
+    const p = satPosition(rec, now);
+    if (!p || Number.isNaN(p.lat)) continue;
+    (star ? stars : sats).push({ ...p, name: rec.name, group: rec.group, id: rec.id, iss: rec.iss, rec });
+  }
+  data.satellites = on.satellites ? sats : null;
+  data.starlink = on.starlink ? stars : null;
+  if (on.satellites) setCount('satellites', sats.length);
+  if (on.starlink) setCount('starlink', stars.length);
+  setStatus('starlink', on.starlink && !stars.length
+    ? 'Starlink orbits not downloaded yet (CelesTrak limits repeat downloads). Retrying automatically every 10 min.' : '');
+  satTick++;
+  if (selectedSat && (cardKind === 'satellites' || cardKind === 'starlink')) {
+    const live = (selectedSat.group === 'starlink' ? stars : sats).find(s => s.id === selectedSat.id);
+    if (live) openCard(cardKind, satCard(live), true);
+  }
+  render();
+}
+setInterval(updateSats, 1000);
+
+// Ground track: from 45 minutes ago to 90 minutes ahead, split where it crosses the date line.
+function selectSat(d) {
+  const paths = [[]], t0 = satNow().getTime();
+  for (let m = -45; m <= 90; m++) {
+    const p = satPosition(d.rec, new Date(t0 + m * 60000));
+    if (!p) continue;
+    const cur = paths.at(-1), last = cur.at(-1);
+    if (last && Math.abs(p.lon - last[0]) > 180) paths.push([]);
+    paths.at(-1).push([p.lon, p.lat]);
+  }
+  selectedSat = { id: d.id, group: d.group, track: paths.filter(p => p.length > 1) };
+}
+
+function satCard(d) {
+  return `<h2>${esc(d.name)}</h2>
+    <div class="sub">${esc(SAT_GROUP[d.group] || d.group)} · NORAD ${esc(d.id)} · CelesTrak</div>
+    ${rows([['Altitude', `${Math.round(d.alt).toLocaleString()} km`], ['Speed', `${d.speed.toFixed(2)} km/s (${Math.round(d.speed * 3600).toLocaleString()} km/h)`],
+      ['Orbit', `once every ${Math.round(d.rec.period)} min`], ['Inclination', `${d.rec.incl.toFixed(1)}°`], ['Over', pos2(d.lat, d.lon)]])}
+    <p class="sub">The line is its path over the ground, from 45 minutes ago to 90 minutes ahead. Positions are calculated from published orbit data and drift slowly between updates.</p>`;
+}
+
+// ---------- timeline replay ----------
+// The server records flights every minute and ships every 5 minutes (last 24 h). In replay,
+// planes and ships come from those recordings (smoothed between snapshots), and quakes, news,
+// fires, disasters and satellites are shown as they were at that moment. Layers that weren't
+// recorded are hidden while replaying.
+const REPLAYABLE = new Set(['flights', 'military', 'ships', 'quakes', 'news', 'fires', 'events', 'satellites', 'starlink', 'cameras', 'cables', 'plants']);
+const replay = { active: false, playing: false, time: Date.now(), frames: { flights: null, ships: null }, loading: {} };
+let historyTimes = { flights: [], ships: [] };
+let V = data; // what render() draws: live data, or the replay view
+let viewCache = { key: '', value: null };
+
+const tl = {
+  bar: document.getElementById('timeline'), live: document.getElementById('tl-live'), play: document.getElementById('tl-play'),
+  speed: document.getElementById('tl-speed'), slider: document.getElementById('tl-slider'),
+  label: document.getElementById('tl-label'), ticks: document.getElementById('tl-ticks'),
+};
+
+const rangeStart = () => Math.min(historyTimes.flights[0] ?? Infinity, historyTimes.ships[0] ?? Infinity, Date.now() - 10 * 60000);
+const timeAt = v => rangeStart() + (v / 1000) * (Date.now() - rangeStart());
+const sliderAt = t => Math.round(((t - rangeStart()) / (Date.now() - rangeStart())) * 1000);
+
+async function loadHistoryTimes() {
+  try { historyTimes = await api('GET', '/api/history'); } catch { /* server busy, try later */ }
+  drawTicks();
+  if (!replay.active) tl.label.textContent = historyTimes.flights.length ? 'Live' : 'Live · recording started';
+}
+
+function drawTicks() {
+  const start = rangeStart(), span = Date.now() - start;
+  tl.ticks.innerHTML = alerts.filter(a => a.time >= start)
+    .map(a => `<i style="left:${((a.time - start) / span) * 100}%" title="${esc(a.title)}"></i>`).join('');
+}
+
+function frameValid(kind) {
+  const f = replay.frames[kind];
+  return f && f.before && replay.time >= f.before.t && (!f.after || replay.time < f.after.t);
+}
+
+async function loadFrame(kind) {
+  if (frameValid(kind) || replay.loading[kind]) return;
+  replay.loading[kind] = true;
+  try {
+    let url = `/api/history/at?kind=${kind}&t=${Math.round(replay.time)}`;
+    if (kind === 'ships') {
+      const b = map.getBounds();
+      url += `&bbox=${[b.getWest(), b.getSouth(), b.getEast(), b.getNorth()].map(n => n.toFixed(2))}`;
+    }
+    replay.frames[kind] = await api('GET', url);
+  } catch { /* keep the old frame */ }
+  replay.loading[kind] = false;
+  if (replay.active) showReplayTime();
+  render();
+}
+
+// Rows from a recording -> objects, sliding each one toward its next recorded position.
+function framePoints(kind, toObj, maxGap) {
+  const f = replay.frames[kind];
+  if (!f?.before || replay.time - f.before.t > maxGap) return [];
+  const span = f.after ? f.after.t - f.before.t : 0;
+  const frac = span ? Math.min(1, (replay.time - f.before.t) / span) : 0;
+  f.nextById ||= new Map((f.after?.rows || []).map(r => [r[0], r]));
+  return f.before.rows.map(r => {
+    const o = toObj(r), n = f.nextById.get(r[0]);
+    if (n && frac) {
+      o.lat += (n[2] - r[2]) * frac;
+      const dl = n[3] - r[3];
+      if (Math.abs(dl) < 180) o.lon += dl * frac;
+    }
+    return o;
+  });
+}
+
+const flightRow = r => ({ hex: r[0], call: r[1], lat: r[2], lon: r[3], alt: r[4] < 0 ? 'ground' : r[4], track: r[5], speed: r[6],
+  mil: Boolean(r[7] & 1), emergency: Boolean(r[7] & 2), sanc: r[7] & 4 ? { by: 'registration' } : null, type: r[8] });
+const shipRow = r => ({ mmsi: r[0], name: r[1], lat: r[2], lon: r[3], course: r[4], heading: r[4], speed: r[5], type: r[6], sanc: r[7] ? { by: 'recorded' } : null });
+
+function currentView() {
+  if (!replay.active) return data;
+  const T = replay.time;
+  const key = `${Math.round(T / 500)}|${replay.frames.flights?.before?.t}|${replay.frames.ships?.before?.t}|${satTick}`;
+  if (viewCache.key === key) return viewCache.value;
+  const flights = framePoints('flights', flightRow, 10 * 60000);
+  const v = {
+    flights, military: flights.filter(f => f.mil),
+    ships: framePoints('ships', shipRow, 15 * 60000),
+    quakes: data.quakes?.filter(q => q.time <= T && q.time > T - 24 * 3600000),
+    news: data.news?.map(p => {
+      const stories = p.stories.filter(s => s.time <= T);
+      return stories.length && { ...p, stories, n: Math.round(p.n * stories.length / p.stories.length) || stories.length };
+    }).filter(Boolean),
+    fires: data.fires?.filter(f => !f.since || f.since <= T),
+    events: data.events?.filter(e => !e.date || new Date(e.date).getTime() <= T),
+    satellites: data.satellites, starlink: data.starlink,
+    cameras: data.cameras, cables: data.cables, plants: data.plants,
+  };
+  viewCache = { key, value: v };
+  for (const id of ['flights', 'military', 'ships', 'quakes', 'fires', 'events']) if (on[id] && v[id]) setCount(id, v[id].length);
+  if (on.news && v.news) setCount('news', v.news.reduce((s, p) => s + p.n, 0));
+  return v;
+}
+
+function showReplayTime() {
+  const d = new Date(replay.time);
+  const mins = Math.round((Date.now() - replay.time) / 60000);
+  const ago = mins < 60 ? `${mins}m ago` : `${Math.floor(mins / 60)}h ${mins % 60}m ago`;
+  const recorded = frameValid('flights') || replay.frames.flights?.before;
+  tl.label.textContent = `${d.toUTCString().slice(17, 22)} UTC · ${ago}${recorded ? '' : ' · not recorded'}`;
+}
+
+function setReplay(t) {
+  const wasLive = !replay.active;
+  replay.active = true;
+  replay.time = Math.min(t, Date.now());
+  tl.bar.classList.add('replaying');
+  tl.live.classList.remove('on');
+  tl.live.textContent = 'Go live';
+  if (wasLive) {
+    if (on.radar && map.getLayer('radar')) map.setLayoutProperty('radar', 'visibility', 'none');
+    for (const l of LAYERS) if (on[l.id] && !REPLAYABLE.has(l.id)) setCount(l.id, 'live only');
+  }
+  showReplayTime();
+  loadFrame('flights');
+  loadFrame('ships');
+  updateSats();
+  render();
+}
+
+function goLive() {
+  replay.active = false;
+  replay.playing = false;
+  replay.frames = { flights: null, ships: null };
+  tl.bar.classList.remove('replaying');
+  tl.live.classList.add('on');
+  tl.live.textContent = '● LIVE';
+  tl.play.textContent = '▶';
+  tl.slider.value = 1000;
+  tl.label.textContent = 'Live';
+  if (on.radar) setRadar();
+  for (const l of LAYERS) if (on[l.id] && data[l.id]) setCount(l.id, (COUNT[l.id] || (d => d.length))(data[l.id]));
+  updateSats();
+  render();
+}
+
+tl.slider.addEventListener('input', () => {
+  if (+tl.slider.value >= 1000) return goLive();
+  setReplay(timeAt(+tl.slider.value));
+});
+tl.live.addEventListener('click', goLive);
+tl.play.addEventListener('click', () => {
+  if (!replay.active) setReplay(rangeStart()); // start from the beginning of the recording
+  replay.playing = !replay.playing;
+  tl.play.textContent = replay.playing ? '❚❚' : '▶';
+});
+
+setInterval(() => {
+  if (!replay.active || !replay.playing) return;
+  const t = replay.time + Number(tl.speed.value) * 250;
+  if (t >= Date.now() - 30000) return goLive();
+  replay.time = t;
+  tl.slider.value = sliderAt(t);
+  showReplayTime();
+  loadFrame('flights');
+  loadFrame('ships');
+  render();
+}, 250);
+
+map.on('moveend', () => { if (replay.active) { replay.frames.ships = null; loadFrame('ships'); } });
+loadHistoryTimes();
+setInterval(loadHistoryTimes, 60000);
+
+CARDS.replayFlight = d => `<h2>${esc(d.call || d.hex)}${d.mil ? '<span class="flag mil">MILITARY</span>' : ''}${d.emergency ? '<span class="flag emg">EMERGENCY</span>' : ''}${d.sanc ? '<span class="flag emg">SANCTIONED</span>' : ''}</h2>
+  <div class="sub">Recorded at ${new Date(replay.time).toUTCString().slice(17, 22)} UTC · ${esc(d.type)} · ICAO ${esc(d.hex)}</div>
+  ${rows([['Altitude', d.alt === 'ground' ? 'on ground' : `${Number(d.alt).toLocaleString()} ft`], ['Speed', `${d.speed} kt`], ['Heading', `${d.track}°`], ['Position', pos2(d.lat, d.lon)]])}
+  <div class="actions"><button id="replay-track">Track it live now</button></div>`;
+
 // ---------- "updated X ago" timers ----------
 const updatedAt = {}; // layer -> time (ms, this browser's clock) its data was last refreshed
 const shortAge = ms => {
@@ -1091,7 +1546,7 @@ function showAges() {
   for (const l of LAYERS) {
     const el = document.getElementById(`age-${l.id}`);
     const t = updatedAt[l.id];
-    if (!on[l.id] || !t) { el.textContent = ''; continue; }
+    if (!on[l.id] || !t || replay.active) { el.textContent = ''; continue; } // replay shows its time in the timeline
     const age = now - t, stale = age > EVERY[l.id] * 3000;
     el.textContent = shortAge(age);
     el.classList.toggle('stale', stale);
@@ -1107,5 +1562,6 @@ setInterval(showAges, 1000);
 loadWatch();
 for (const l of LAYERS) if (on[l.id] && l.kind === 'feed') loadFeed(l.id);
 if (on.radar) setRadar();
+if (on.satellites || on.starlink) loadSatellites();
 connect();
 setInterval(() => { document.getElementById('clock').textContent = new Date().toISOString().slice(11, 19) + ' UTC'; }, 1000);

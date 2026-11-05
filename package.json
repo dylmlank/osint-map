@@ -5,7 +5,9 @@
   "type": "module",
   "description": "Live map of flights, ships and traffic cameras from free public feeds",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test \"test/*.test.js\"",
+    "check-sources": "node scripts/check-sources.js"
   },
   "engines": {
     "node": ">=22"

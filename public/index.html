@@ -9,7 +9,7 @@
     (function () {
       var on = { flights: 1, cameras: 1, news: 1, quakes: 1 };
       try { var saved = JSON.parse(localStorage.getItem('osint-layers')); if (saved) on = saved; } catch (e) {}
-      var feeds = ['military', 'cameras', 'news', 'quakes', 'fires', 'events', 'alerts', 'cables', 'plants'];
+      var feeds = ['military', 'cameras', 'news', 'quakes', 'fires', 'events', 'alerts', 'cables', 'plants', 'sanctioned', 'dark', 'jamming'];
       window.prefetch = {};
       feeds.forEach(function (f) {
         if (on[f]) window.prefetch[f] = fetch('/api/' + f).then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; });
@@ -41,6 +41,7 @@
     <div class="basemap" role="radiogroup" aria-label="Map style">
       <button data-basemap="dark" role="radio">Dark map</button>
       <button data-basemap="satellite" role="radio">Satellite</button>
+      <button id="toggle-3d" aria-pressed="false" title="3D mountains and buildings (or right-click the map)">3D</button>
     </div>
     <section class="watch">
       <div class="watch-head">
@@ -60,6 +61,21 @@
   </aside>
 
   <div id="toasts" aria-live="polite"></div>
+
+  <div id="timeline">
+    <button id="tl-live" class="on" title="Back to live">● LIVE</button>
+    <button id="tl-play" title="Play / pause">▶</button>
+    <select id="tl-speed" title="Playback speed">
+      <option value="60">1 min/s</option>
+      <option value="300" selected>5 min/s</option>
+      <option value="1800">30 min/s</option>
+    </select>
+    <div class="tl-track">
+      <input type="range" id="tl-slider" min="0" max="1000" value="1000" aria-label="Time">
+      <div id="tl-ticks"></div>
+    </div>
+    <span id="tl-label" class="mono">Live</span>
+  </div>
 
   <article id="card" hidden>
     <button id="card-close" aria-label="Close">×</button>
