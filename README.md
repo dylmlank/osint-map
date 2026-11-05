@@ -1,6 +1,6 @@
 # OSINT Map
 
-A live map built only from free public data: flights (with route and track history), military aircraft, ships, about 7,400 road cameras in 7 regions, world news, earthquakes, natural disasters, wildfires, weather alerts, rain radar, undersea cables, power plants and satellites. On top of that it flags sanctioned ships and planes, ships that go silent, and GPS jamming, and a timeline lets you replay the last 24 hours. You can switch between a dark map and satellite imagery, view mountains and buildings in 3D, and search for places, flights, ships and cameras.
+A live map built only from free public data: flights (with route and track history), military aircraft, ships, about 9,400 road cameras in 9 regions, world news, earthquakes, natural disasters, wildfires, weather alerts, rain radar, undersea cables, power plants and satellites. On top of that it flags sanctioned ships and planes, ships that go silent, and GPS jamming, and a timeline lets you replay the last 24 hours. You can switch between a dark map and satellite imagery, and search for places, flights, ships and cameras.
 
 ## Run it
 
@@ -15,7 +15,6 @@ Open http://localhost:8790. You need Node 22 or newer. There's nothing to instal
 - **Search box:** results from data already on the map show as you type. Press **Enter** to also search places (OpenStreetMap) and flights anywhere in the world by callsign, registration or ICAO hex.
 - **Click a plane** to track it. The card shows departure → destination with a progress bar. On the map, the cyan line is the path flown today (from takeoff), the pink line is the remaining route, and pins mark both airports. **Follow** keeps the map centered on the plane.
 - **Dark map / Satellite** switches the background (satellite imagery is from Esri).
-- **3D:** **right-click** the map (or press **3D**) to see real mountains and building heights. Right-drag or Ctrl+drag tilts and turns the view, and tilting turns 3D on automatically. Right-click again to go back to flat. Buildings show up from about street level (zoom 13 and closer).
 - **Timeline** (bottom bar): drag the slider to see how things were at any point in the last 24 hours, or press ▶ to play it back at 1, 5 or 30 minutes per second. Red ticks mark alerts. **Go live** returns to now. Flights are recorded every minute and ships every 5 minutes; earthquakes, news, fires, disasters and satellites are shown as they were at that moment. Layers that aren't recorded (radar, weather alerts, GPS jamming, silent ships) are hidden during replay. Recording only happens while the server is running, and it's kept in `data/history/`.
 - **Color key** at the bottom of the panel lists every icon.
 - **Update timers:** under each layer's count is how long ago its data was last refreshed (for radar, how old the radar picture is). It turns amber when a layer is more than 3× late, which usually means the source is slow or down. Hover over it to see the exact time. Watchlist rows show when each item was last seen or checked.
@@ -35,6 +34,13 @@ Open http://localhost:8790. You need Node 22 or newer. There's nothing to instal
 - Areas you've looked at in the last 15 minutes stay refreshed, so going back to one or reloading the page shows planes right away. A brand-new area loads in about 0.5 s.
 - Between updates, planes keep moving along their heading, so they glide instead of jumping.
 
+## Speed
+
+- **Redraws match zoom.** Planes and satellites are redrawn only as often as they'd move a visible amount: about 10× a second at street level, once every 1–2 s zoomed out. Nothing animates while the tab is hidden or while you drag the map. Icons shrink when zoomed out, and drawing resolution is capped at 1.5× on very sharp screens.
+- **Ships are sent lean.** Each ship is one short row (details load when you click it). Zoomed far out, at most 4,000–8,000 ships are sent, moving ones first, every 15 s instead of 5 s. That's about 25× less data than before.
+- **Your view comes first.** Flight requests for the area you're looking at skip ahead of background work (jamming hotspots, areas viewed earlier) in the rate-limit queue. Areas viewed in the last 15 min stay cached, so going back is instant.
+- **Repeat visits are near-instant.** The page's files are gzipped and answered with "not changed" when nothing changed. A service worker (`public/sw.js`) keeps the map libraries (about 2.5 MB) and the map tiles you've seen (up to 4,000) on your computer. Live data is never cached by it. The page starts downloading the data for your switched-on layers and the right basemap before the map libraries finish loading.
+
 ## Layers
 
 | Layer | Source | Refresh | Notes |
@@ -43,7 +49,7 @@ Open http://localhost:8790. You need Node 22 or newer. There's nothing to instal
 | Military | adsb.lol `/v2/mil` | 15 s | Worldwide |
 | Flight track and route | adsb.lol traces and route list | when clicked | Route list is community-made and can be wrong; mismatches are flagged |
 | Ships | aisstream.io | 5 s | Needs a free key (see below) |
-| Road cameras | Caltrans, DriveBC, TfL, HK Transport Dept, Fintraffic, NZTA, Singapore LTA | 10 min | California and London have video |
+| Road cameras | Caltrans, WSDOT, Seattle DOT, DriveBC, TfL, HK Transport Dept, Fintraffic, NZTA, Singapore LTA | 10 min | California and London have video |
 | News | GDELT 2.0 event export | 15 min | Last 6 h, grouped by place |
 | Earthquakes | USGS | 1 min | Past 24 h |
 | Natural disasters | NASA EONET | 15 min | Volcanoes, storms, ice, fires worldwide |
@@ -56,7 +62,6 @@ Open http://localhost:8790. You need Node 22 or newer. There's nothing to instal
 | Ships gone silent | Worked out from the ship feed | 1 min | Was moving, then no reports for 20 min–6 h. "Likely switched off" if ships nearby are still being heard, "maybe out of range" if not |
 | GPS jamming | Worked out from aircraft GPS accuracy (NACp) | 1 min | 1° squares, last hour. Only planes broadcasting their own ADS-B v2 position count. Areas you've viewed plus known hotspots (Baltic, Black Sea, E. Mediterranean, Middle East, Korea) are sampled |
 | Satellites / Starlink | CelesTrak orbit data, positions computed in the browser | every 6 h | Space stations, GPS, weather, military, geostationary, plus ~10,000 Starlink. Click one for its path over the ground |
-| 3D terrain / buildings | AWS Terrain Tiles, OpenFreeMap | on demand | |
 
 ## Turn on ships
 
@@ -102,7 +107,6 @@ This tries every outside source once, live, and reports which ones answer and ho
 - GDELT's places and categories are guessed by software from article text, and they're often wrong. Treat a news dot as a lead, not a fact.
 - **Sanctions, silent ships and jamming are leads, not proof.** Only the US list is used (not EU/UK). A ship can go quiet because it left receiver range. Jamming coverage is only as good as the number of planes flying there, so it's thin at night.
 - CelesTrak refuses repeat downloads of the same orbit data within 2 hours. If a group is missing, the server retries it every 10 minutes.
-- In 3D, map icons stay drawn on top rather than sitting on the terrain, so they can look slightly offset in steep mountains.
 - Some aircraft are hidden from public trackers on purpose, and ships can switch AIS off. If something is missing from the map, that doesn't prove it isn't there.
 - Flight coverage depends on volunteer receivers, so it's thin in some places (Japan, for example). Ship coverage from aisstream is thin far from shore and in the Persian Gulf.
 - Every adsb.lol and adsb.fi request goes through a queue that spaces requests out and pauses for 30 s after a "too many requests" error. When that happens the map keeps showing the last good data.

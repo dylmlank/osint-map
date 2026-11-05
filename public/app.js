@@ -29,7 +29,7 @@ const LAYERS = [
   { id: 'flights',  group: 'Tracking',       label: 'Flights near view',    icon: ['plane', C.planeLow],  kind: 'push', on: true },
   { id: 'military', group: 'Tracking',       label: 'Military (worldwide)', icon: ['plane', C.military],  kind: 'feed' },
   { id: 'ships',    group: 'Tracking',       label: 'Ships',                icon: ['ship', SHIP.Cargo],   kind: 'push' },
-  { id: 'cameras',  group: 'Cameras',        label: 'Road cameras (7 regions)', icon: ['camera', C.camera], kind: 'feed', on: true },
+  { id: 'cameras',  group: 'Cameras',        label: 'Road cameras (9 regions)', icon: ['camera', C.camera], kind: 'feed', on: true },
   { id: 'news',     group: 'World events',   label: 'News (last 6 h)',      icon: ['news', NEWS.violence], kind: 'feed', on: true },
   { id: 'quakes',   group: 'World events',   label: 'Earthquakes (24 h)',   icon: ['quake', '#facc15'],   kind: 'feed', on: true },
   { id: 'events',   group: 'World events',   label: 'Natural disasters',    icon: ['volcano', '#ef4444'], kind: 'feed' },
@@ -111,10 +111,12 @@ if (!BASEMAPS[basemap]) basemap = 'dark';
 const view = store.get('osint-view', { center: [-118.3, 34.0], zoom: 7 });
 const map = new maplibregl.Map({
   container: 'map', style: BASEMAPS[basemap],
-  center: view.center, zoom: view.zoom, attributionControl: { compact: true }, maxPitch: 80,
+  center: view.center, zoom: view.zoom, attributionControl: { compact: true }, pitchWithRotate: false,
 });
 map.addControl(new maplibregl.NavigationControl(), 'bottom-right');
-const overlay = new MapboxOverlay({ layers: [], getTooltip: tooltip });
+// Cap the drawing resolution on very sharp screens: 1.5x looks the same for dots and icons
+// and is up to ~45% less GPU work than 2x or more.
+const overlay = new MapboxOverlay({ layers: [], getTooltip: tooltip, useDevicePixels: Math.min(window.devicePixelRatio || 1, 1.5) });
 map.addControl(overlay);
 // Resolves once the current map style has loaded (replaced whenever the style changes).
 let styleReady = new Promise(r => map.once('style.load', r));
@@ -132,79 +134,13 @@ basemapButtons.forEach(b => b.addEventListener('click', () => {
   styleReady = new Promise(r => map.once('style.load', r));
   map.setStyle(BASEMAPS[basemap]);
 }));
-// A new style drops our radar and 3D layers, so put them back whenever a style finishes loading.
-map.on('style.load', () => { if (on.radar) setRadar(); if (is3D) add3D(); });
+// A new style drops our radar layer, so put it back whenever a style finishes loading.
+map.on('style.load', () => { if (on.radar) setRadar(); });
 
-// ---------- 3D: real terrain (AWS elevation tiles) + building heights (OpenFreeMap) ----------
-// Right-click toggles it; tilting with right-drag turns it on automatically.
-let is3D = store.get('osint-3d', false);
-const button3D = document.getElementById('toggle-3d');
-
-function add3D() {
-  if (!map.getSource('terrain-dem')) {
-    map.addSource('terrain-dem', {
-      type: 'raster-dem', encoding: 'terrarium', tileSize: 256, maxzoom: 14,
-      tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],
-      attribution: 'Elevation: Mapzen / AWS Terrain Tiles',
-    });
-  }
-  map.setTerrain({ source: 'terrain-dem', exaggeration: 1.4 });
-  if (basemap === 'dark' && !map.getLayer('hillshade')) {
-    // Shade slopes so mountains read on the dark map (satellite imagery is already shaded).
-    const firstLabel = map.getStyle().layers.find(l => l.type === 'symbol')?.id;
-    map.addLayer({ id: 'hillshade', type: 'hillshade', source: 'terrain-dem',
-      paint: { 'hillshade-exaggeration': 0.5, 'hillshade-shadow-color': '#000000', 'hillshade-highlight-color': '#3b4757' } }, firstLabel);
-  }
-  if (!map.getSource('ofm')) map.addSource('ofm', { type: 'vector', url: 'https://tiles.openfreemap.org/planet', attribution: 'Buildings: OpenFreeMap, OpenStreetMap' });
-  if (!map.getLayer('buildings-3d')) {
-    map.addLayer({
-      id: 'buildings-3d', type: 'fill-extrusion', source: 'ofm', 'source-layer': 'building', minzoom: 13,
-      paint: {
-        'fill-extrusion-color': basemap === 'dark' ? '#2c3a4b' : '#e7e2d8',
-        'fill-extrusion-height': ['coalesce', ['get', 'render_height'], 8],
-        'fill-extrusion-base': ['coalesce', ['get', 'render_min_height'], 0],
-        'fill-extrusion-opacity': 0.85,
-      },
-    });
-  }
-}
-
-function remove3D() {
-  map.setTerrain(null);
-  for (const id of ['buildings-3d', 'hillshade']) if (map.getLayer(id)) map.removeLayer(id);
-}
-
-async function set3D(onOff, { tilt = true } = {}) {
-  is3D = onOff;
-  store.set('osint-3d', is3D);
-  button3D.setAttribute('aria-pressed', String(is3D));
-  await styleReady;
-  if (is3D) {
-    add3D();
-    if (tilt) {
-      if (map.getPitch() < 30) map.easeTo({ pitch: 65, duration: 1200 });
-      toast({ kind: 'info', title: '3D on', detail: 'Right-drag (or Ctrl + drag) to tilt and turn. Zoom in close to see buildings. Right-click again to go back to flat.' }, 6000);
-    }
-  } else {
-    remove3D();
-    map.easeTo({ pitch: 0, bearing: 0, duration: 800 });
-  }
-}
-
-button3D.addEventListener('click', () => set3D(!is3D));
-button3D.setAttribute('aria-pressed', String(is3D));
-if (is3D) set3D(true, { tilt: false });
-
-// A right-click without dragging toggles 3D (a right-drag just tilts/rotates as usual).
-let rightDown = null;
-map.on('mousedown', e => { if (e.originalEvent.button === 2) rightDown = e.point; });
-map.on('contextmenu', e => {
-  e.originalEvent.preventDefault();
-  const moved = rightDown && Math.hypot(e.point.x - rightDown.x, e.point.y - rightDown.y) > 5;
-  rightDown = null;
-  if (!moved) set3D(!is3D);
-});
-map.on('pitchend', () => { if (!is3D && map.getPitch() > 25) set3D(true, { tilt: false }); });
+// The map stays flat and north-up: tilted views made icons look misplaced and cost GPU time.
+map.dragRotate.disable();
+map.touchZoomRotate.disableRotation();
+try { localStorage.removeItem('osint-3d'); } catch { /* storage off */ }
 
 // ---------- panel ----------
 const panel = document.getElementById('layers');
@@ -301,7 +237,7 @@ function connect() {
   es.addEventListener('ships', e => {
     const j = JSON.parse(e.data);
     setStatus('ships', j.status === 'no-key' ? 'Ships off: add a free AISSTREAM_KEY to .env' : j.status === 'live' ? '' : `Ships: ${j.status}`);
-    accept('ships', j.ships);
+    accept('ships', j.ships.map(shipRow)); // compact rows; details load when a ship is clicked
   });
   es.addEventListener('checked', e => {
     const j = JSON.parse(e.data), offset = Date.now() - j.now;
@@ -324,7 +260,7 @@ function sendView(delay = 250) {
     const c = map.getCenter(), b = map.getBounds();
     const layers = LAYERS.filter(l => on[l.id]).map(l => l.id).join(',');
     const bbox = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()].map(n => n.toFixed(3)).join(',');
-    fetch(`/api/view?id=${clientId}&lat=${c.lat.toFixed(3)}&lon=${c.lng.toFixed(3)}&bbox=${bbox}&layers=${layers}`);
+    fetch(`/api/view?id=${clientId}&lat=${c.lat.toFixed(3)}&lon=${c.lng.toFixed(3)}&bbox=${bbox}&zoom=${map.getZoom().toFixed(1)}&layers=${layers}`);
   }, delay);
 }
 
@@ -384,6 +320,7 @@ function sanctionRings() {
 
 function sanctionBlock(s) {
   if (!s) return '';
+  if (!s.programs) return '<div class="route sanc"><b>Sanctioned (US OFAC)</b><small>Loading details…</small></div>';
   return `<div class="route sanc"><b>Sanctioned (US OFAC)</b>
     <small>Listed as ${esc(s.name)} · programs: ${esc(s.programs.join(', '))}</small>
     ${s.owner ? `<small>Owner: ${esc(s.owner)}</small>` : ''}${s.operator ? `<small>Operator: ${esc(s.operator)}</small>` : ''}
@@ -401,14 +338,31 @@ function movedPosition(f, sinceMs) {
   return [f.lon + (nm / 60) * Math.sin(rad) / Math.cos(f.lat * Math.PI / 180), f.lat + (nm / 60) * Math.cos(rad)];
 }
 
+// How often to redraw moving things so each step is about `stepPx` pixels on screen: a plane
+// at ~830 km/h crosses a pixel every few seconds when zoomed out, so redrawing 10x a second
+// there is wasted work. Returns milliseconds between redraws.
+function redrawInterval(kmPerSec, stepPx, min, max) {
+  const kmPerPx = 40075 * Math.cos(map.getCenter().lat * Math.PI / 180) / (512 * 2 ** map.getZoom());
+  return Math.min(max, Math.max(min, (stepPx / (kmPerSec / kmPerPx)) * 1000));
+}
+
 let lastFrame = 0;
 function animate(now) {
-  if ((on.flights || on.military || tracked) && now - lastFrame > 100) { lastFrame = now; tick++; render(); }
+  const moving = on.flights || on.military || tracked;
+  // Skip while the tab is hidden or the map is being dragged (it redraws anyway then).
+  if (moving && !document.hidden && !replay.active && !map.isMoving()
+      && now - lastFrame > redrawInterval(0.23, 0.7, 100, 2000)) {
+    lastFrame = now; tick++; render();
+  }
   requestAnimationFrame(animate);
 }
 requestAnimationFrame(animate);
 
 // ---------- layers ----------
+// Smaller icons when zoomed out: less clutter, and far fewer pixels for the GPU to fill.
+const iconScale = () => { const z = map.getZoom(); return z < 3 ? 0.55 : z < 5 ? 0.7 : z < 7 ? 0.85 : 1; };
+map.on('zoomend', () => render());
+
 function icons(id, { shape, color, size, angle, ...extra }) {
   return new IconLayer({
     id, data: V[id], pickable: true,
@@ -416,7 +370,7 @@ function icons(id, { shape, color, size, angle, ...extra }) {
     getIcon: typeof shape === 'function'
       ? d => Icons.icon(shape(d), color(d))
       : d => Icons.icon(shape, typeof color === 'function' ? color(d) : color),
-    getSize: size, sizeUnits: 'pixels',
+    getSize: size, sizeUnits: 'pixels', sizeScale: iconScale(),
     ...(angle && { getAngle: angle }),
     onClick: ({ object }) => select(id, object),
     ...extra,
@@ -839,6 +793,11 @@ function select(kind, d) {
   if (selectedSat && kind !== 'satellites' && kind !== 'starlink') selectedSat = null;
   if (kind === 'satellites' || kind === 'starlink') selectSat(d);
   openCard(kind, CARDS[kind](d));
+  // Live ships arrive as compact rows; fetch the full record (destination, IMO, sanctions) on click.
+  if (kind === 'ships' && !d.full && !replay.active) {
+    fetch(`/api/ship?mmsi=${encodeURIComponent(d.mmsi)}`).then(r => (r.ok ? r.json() : null)).catch(() => null)
+      .then(full => { if (full && cardKind === 'ships') select('ships', { ...d, ...full, full: true }); });
+  }
   if (kind === 'replayFlight') {
     document.getElementById('replay-track').onclick = async () => {
       goLive();
@@ -1336,7 +1295,11 @@ function updateSats() {
   }
   render();
 }
-setInterval(updateSats, 1000);
+// Satellites move ~7.5 km/s; zoomed out that's well under a pixel a second, so update less often.
+(function satLoop() {
+  if (!document.hidden) updateSats();
+  setTimeout(satLoop, (on.satellites || on.starlink) ? redrawInterval(7.5, 1, 1000, 5000) : 2000);
+})();
 
 // Ground track: from 45 minutes ago to 90 minutes ahead, split where it crosses the date line.
 function selectSat(d) {
@@ -1433,7 +1396,8 @@ function framePoints(kind, toObj, maxGap) {
 
 const flightRow = r => ({ hex: r[0], call: r[1], lat: r[2], lon: r[3], alt: r[4] < 0 ? 'ground' : r[4], track: r[5], speed: r[6],
   mil: Boolean(r[7] & 1), emergency: Boolean(r[7] & 2), sanc: r[7] & 4 ? { by: 'registration' } : null, type: r[8] });
-const shipRow = r => ({ mmsi: r[0], name: r[1], lat: r[2], lon: r[3], course: r[4], heading: r[4], speed: r[5], type: r[6], sanc: r[7] ? { by: 'recorded' } : null });
+// Same row layout for live ship pushes and timeline recordings (see shipRow in feeds.js).
+const shipRow = r => ({ mmsi: r[0], name: r[1], lat: r[2], lon: r[3], course: r[4], heading: r[4], speed: r[5], type: r[6], sanc: r[7] ? { by: 'list' } : null });
 
 function currentView() {
   if (!replay.active) return data;

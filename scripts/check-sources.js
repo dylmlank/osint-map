@@ -42,8 +42,6 @@ const checks = {
   'Rain radar (RainViewer)': async () => atLeast((await get('https://api.rainviewer.com/public/weather-maps.json')).radar.past.length, 1, 'radar frames'),
   'Place search (Nominatim)': async () => atLeast((await get('https://nominatim.openstreetmap.org/search?format=json&limit=1&q=London')).length, 1, 'result'),
   'Satellite imagery (Esri)': async () => `${((await get('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/3/3/2', 'buffer')).length / 1000).toFixed(0)} KB tile`,
-  '3D terrain (AWS)': async () => `${((await get('https://s3.amazonaws.com/elevation-tiles-prod/terrarium/8/41/98.png', 'buffer')).length / 1000).toFixed(0)} KB tile`,
-  '3D buildings (OpenFreeMap)': async () => atLeast((await get('https://tiles.openfreemap.org/planet')).vector_layers.length, 5, 'tile layers'),
 };
 
 const warnOnly = new Set(['Satellites (CelesTrak)']); // CelesTrak refuses repeat downloads within 2 h

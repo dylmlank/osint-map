@@ -60,10 +60,9 @@ h1 span { color: var(--accent); margin-left: 4px; }
 #results button img { width: 16px; height: 16px; }
 #results small { display: block; color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-.basemap { display: grid; grid-template-columns: 1fr 1fr 0.6fr; gap: 0; margin-bottom: 4px; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+.basemap { display: grid; grid-template-columns: 1fr 1fr; gap: 0; margin-bottom: 4px; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
 .basemap button { padding: 6px 0; background: none; border: 0; color: var(--muted); font: inherit; font-size: 12px; cursor: pointer; }
-#toggle-3d { border-left: 1px solid var(--line); font-weight: 600; }
-.basemap button[aria-checked="true"], #toggle-3d[aria-pressed="true"] { background: rgba(34, 211, 238, 0.16); color: var(--text); }
+.basemap button[aria-checked="true"] { background: rgba(34, 211, 238, 0.16); color: var(--text); }
 
 .key { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); }
 .key summary { cursor: pointer; }

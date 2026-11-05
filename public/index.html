@@ -5,22 +5,40 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>OSINT Map</title>
   <script>
-    // Start downloading data right away, in parallel with the map libraries below.
+    // Start downloading everything this visit will need right away, in parallel with the map
+    // libraries below: the data for layers that are switched on, and the right basemap.
     (function () {
       var on = { flights: 1, cameras: 1, news: 1, quakes: 1 };
-      try { var saved = JSON.parse(localStorage.getItem('osint-layers')); if (saved) on = saved; } catch (e) {}
+      var basemap = 'dark';
+      try {
+        var saved = JSON.parse(localStorage.getItem('osint-layers')); if (saved) on = saved;
+        basemap = JSON.parse(localStorage.getItem('osint-basemap')) || 'dark';
+      } catch (e) {}
       var feeds = ['military', 'cameras', 'news', 'quakes', 'fires', 'events', 'alerts', 'cables', 'plants', 'sanctioned', 'dark', 'jamming'];
       window.prefetch = {};
       feeds.forEach(function (f) {
         if (on[f]) window.prefetch[f] = fetch('/api/' + f).then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; });
       });
+      var hint = function (rel, href, as) {
+        var l = document.createElement('link'); l.rel = rel; l.href = href; if (as) l.as = as;
+        if (as !== 'script') l.crossOrigin = 'anonymous'; // scripts are loaded without CORS, so the preload must match
+        document.head.appendChild(l);
+      };
+      if (basemap === 'satellite') {
+        hint('preconnect', 'https://server.arcgisonline.com');
+      } else {
+        hint('preconnect', 'https://tiles.basemaps.cartocdn.com');
+        hint('preload', 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json', 'fetch');
+      }
+      if (on.satellites || on.starlink) hint('preload', 'https://unpkg.com/satellite.js@5.0.0/dist/satellite.min.js', 'script');
+      // Keep libraries and map tiles on this computer for fast repeat visits.
+      if ('serviceWorker' in navigator) {
+        window.addEventListener('load', function () { navigator.serviceWorker.register('/sw.js').catch(function () {}); });
+      }
     })();
   </script>
-  <link rel="preconnect" href="https://basemaps.cartocdn.com" crossorigin>
-  <link rel="preconnect" href="https://tiles.basemaps.cartocdn.com" crossorigin>
   <link rel="preload" as="script" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js">
   <link rel="preload" as="script" href="https://unpkg.com/deck.gl@9.0.38/dist.min.js">
-  <link rel="preload" as="fetch" href="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json" crossorigin>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@400;600&display=swap" rel="stylesheet">
   <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
@@ -40,9 +58,7 @@
     </div>
     <div class="basemap" role="radiogroup" aria-label="Map style">
       <button data-basemap="dark" role="radio">Dark map</button>
-      <button data-basemap="satellite" role="radio">Satellite</button>
-      <button id="toggle-3d" aria-pressed="false" title="3D mountains and buildings (or right-click the map)">3D</button>
-    </div>
+      <button data-basemap="satellite" role="radio">Satellite</button>    </div>
     <section class="watch">
       <div class="watch-head">
         <span class="group">Watchlist</span>

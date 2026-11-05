@@ -46,6 +46,20 @@ export const finland = {
 
 export const newZealand = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><response><camera><description>South along Hinds Highway from Lagmhor Rd</description><direction>Southbound</direction><group>NA</group><highway>SH1</highway><id>714</id><imageUrl>/camera/714.jpg</imageUrl><journey><id>86</id><name>SH1</name><startLatitude>-41.95</startLatitude><startLongitude>174.06</startLongitude></journey><journeyLeg><name>Ashburton to Rangitata</name><totalLength>35.425</totalLength></journeyLeg><latitude>-43.919632</latitude><longitude>171.721055</longitude><name>SH1 Tinwald </name><offline>false</offline><region><id>11</id><name>Canterbury</name></region><sortOrder>0</sortOrder></camera></response>';
 
+export const washington = {
+  cameras: { items: [
+    { id: 10079, url: 'https://images.wsdot.wa.gov/airports/WoodlandS.jpg', title: 'Woodland South', roadName: 'Airports', direction: 'S', milepost: 21, lat: 45.903654, lon: -122.740657, video: 0 },
+    { id: 1, url: 'https://images.wsdot.wa.gov/nw/005vc16590.jpg', title: 'I-5 at NE 45th St', roadName: 'I-5', direction: '', milepost: 169, lat: 47.66, lon: -122.32, video: 0 },
+  ] },
+};
+
+export const seattle = {
+  Features: [
+    { PointCoordinate: [47.526783365445, -122.392755787503], Cameras: [{ Id: 'CMR-0112', Description: 'Fauntleroy Way SW & SW Cloverdale St', ImageUrl: 'Fauntleroy_SW_Cloverdale_NS.jpg', Type: 'sdot' }] },
+    { PointCoordinate: [47.646193796626, -122.349856493721], Cameras: [{ Id: 'SR99Raye', Description: 'SR-99 @ Raye St', ImageUrl: '099vc03415.jpg', Type: 'wsdot' }] },
+  ],
+};
+
 export const singapore = {
   items: [{ timestamp: '2026-11-06T05:20:01+08:00', cameras: [
     { timestamp: '2026-11-06T05:16:01+08:00', image: 'https://images.data.gov.sg/api/traffic-images/2026/11/1941b055.jpg', location: { latitude: 1.447023728, longitude: 103.7716543 }, camera_id: '2701' },

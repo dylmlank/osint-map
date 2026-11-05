@@ -7,6 +7,7 @@ test('camera parsers turn every agency format into the same shape', () => {
   const cases = {
     California: fx.california, 'British Columbia': fx.drivebc, London: fx.tfl, 'Hong Kong': fx.hongKong,
     Finland: fx.finland, 'New Zealand': fx.newZealand, Singapore: fx.singapore,
+    Washington: fx.washington, Seattle: fx.seattle,
   };
   assert.deepEqual(Object.keys(cases).sort(), Object.keys(F.CAMERA_PARSERS).sort(), 'every source has a test sample');
   for (const [name, raw] of Object.entries(cases)) {
@@ -39,6 +40,14 @@ test('camera parsers keep the details that matter', () => {
   const [nz] = F.CAMERA_PARSERS['New Zealand'](fx.newZealand);
   assert.equal(nz.lat, -43.919632); // the camera's own position, not the journey start
   assert.equal(nz.place, 'Canterbury');
+
+  const wa = F.CAMERA_PARSERS.Washington(fx.washington);
+  assert.equal(wa[0].route, 'Airports · facing S');
+  assert.equal(wa[1].route, 'I-5'); // no direction given
+
+  const sea = F.CAMERA_PARSERS.Seattle(fx.seattle);
+  assert.equal(sea.length, 1); // the WSDOT duplicate is skipped
+  assert.equal(sea[0].image, 'https://www.seattle.gov/trafficcams/images/Fauntleroy_SW_Cloverdale_NS.jpg');
 
   const [ldn] = F.CAMERA_PARSERS.London(fx.tfl);
   assert.equal(ldn.videoType, 'mp4');

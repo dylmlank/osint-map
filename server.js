@@ -2,7 +2,7 @@
 // browser over Server-Sent Events. No dependencies — Node 22+.
 import http from 'node:http';
 import zlib from 'node:zlib';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -116,7 +116,7 @@ const history = createHistory({
         const out = [], fresh = Date.now() - 30 * M;
         for (const s of F.allShips()) {
           if (s.lat == null || s.seen < fresh) continue;
-          out.push([s.mmsi, s.name || '', r3(s.lat), r3(s.lon), Math.round(s.course || 0), Math.round((s.speed || 0) * 10) / 10, s.type || 0, s.sanc ? 1 : 0]);
+          out.push(F.shipRow(s));
         }
         return out;
       },
@@ -159,6 +159,7 @@ function updateView(q) {
   const regionChanged = region !== c.region;
   c.region = region;
   c.bbox = (q.get('bbox') || '-180,-90,180,90').split(',').map(Number);
+  c.zoom = Number(q.get('zoom')) || 5;
 
   if (layers.has('flights') && (regionChanged || added.includes('flights'))) pushFlights(c);
   if (layers.has('ships')) pushShips(c);
@@ -166,12 +167,16 @@ function updateView(q) {
 }
 
 async function pushFlights(c) {
-  try { sendEvent(c, 'flights', JSON.stringify(await F.flightsNear(c.region))); }
+  try { sendEvent(c, 'flights', JSON.stringify(await F.flightsNear(c.region, 'user'))); } // someone is looking at it
   catch (err) { sendEvent(c, 'status', JSON.stringify({ layer: 'flights', error: err.message })); }
 }
 
+// Zoomed far out, ships barely move on screen and there can be 10,000+ of them, so send
+// fewer, less often. Each ship is a compact row (see F.shipRow).
+const shipLimit = zoom => (zoom < 3 ? 4000 : zoom < 5 ? 8000 : 20000);
 function pushShips(c) {
-  sendEvent(c, 'ships', JSON.stringify({ status: F.ais.status, total: F.ais.total(), ships: F.shipsIn(c.bbox) }));
+  const ships = F.shipsIn(c.bbox, shipLimit(c.zoom)).map(F.shipRow);
+  sendEvent(c, 'ships', JSON.stringify({ status: F.ais.status, total: F.ais.total(), ships }));
 }
 
 // Flights and ships depend on each browser's view, so they're pushed on their own beat.
@@ -179,8 +184,14 @@ setInterval(() => {
   for (const c of clients.values()) if (c.layers.has('flights') && c.region) pushFlights(c);
 }, 8 * S);
 setInterval(() => {
-  for (const c of clients.values()) if (c.layers.has('ships') && c.bbox) pushShips(c);
+  shipTick++;
+  for (const c of clients.values()) {
+    if (!c.layers.has('ships') || !c.bbox) continue;
+    if (c.zoom < 5 && shipTick % 3) continue; // every 15 s when zoomed out, 5 s otherwise
+    pushShips(c);
+  }
 }, 5 * S);
+let shipTick = 0;
 setInterval(() => { for (const c of clients.values()) c.res.write(': ping\n\n'); }, 20 * S);
 
 // When each feed was last checked successfully, so the panel can show "updated 20s ago".
@@ -195,7 +206,27 @@ setInterval(() => broadcastAll('checked', checkedTimes()), 10 * S);
 F.flightsNear(F.regionKey(34, -118.3)).catch(() => {});
 
 // ---------- http ----------
-const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml' };
+const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.json': 'application/json' };
+
+// The page's own files: gzipped once and kept in memory, with an ETag so a repeat visit
+// gets a tiny "304 not changed" instead of the whole file again.
+const staticFiles = new Map(); // path -> { mtime, buf, gz, etag }
+async function serveStatic(req, res, file) {
+  const info = await stat(file);
+  let f = staticFiles.get(file);
+  if (!f || f.mtime !== info.mtimeMs) {
+    const buf = await readFile(file);
+    const type = MIME[extname(file)] || 'application/octet-stream';
+    f = { mtime: info.mtimeMs, buf, type, etag: `"${info.size.toString(36)}-${Math.round(info.mtimeMs).toString(36)}"`,
+      gz: /text|javascript|json|svg/.test(type) ? zlib.gzipSync(buf) : null };
+    staticFiles.set(file, f);
+  }
+  if (req.headers['if-none-match'] === f.etag) { res.writeHead(304, { ETag: f.etag }); return res.end(); }
+  const gzip = f.gz && /\bgzip\b/.test(req.headers['accept-encoding'] || '');
+  res.writeHead(200, { 'Content-Type': f.type, 'Cache-Control': 'no-cache', ETag: f.etag, Vary: 'Accept-Encoding',
+    ...(gzip && { 'Content-Encoding': 'gzip' }) });
+  res.end(gzip ? f.gz : f.buf);
+}
 
 function send(res, code, body, type = 'application/json') {
   res.writeHead(code, { 'Content-Type': type, 'Cache-Control': 'no-store' });
@@ -236,6 +267,10 @@ http.createServer(async (req, res) => {
     if (url.pathname === '/api/alerts' && req.method === 'DELETE') { watch.clearAlerts(); return send(res, 204, ''); }
     if (url.pathname === '/api/geocode') return send(res, 200, await F.geocode(q.get('q') || ''));
     if (url.pathname === '/api/find') return send(res, 200, await F.findFlight(q.get('q') || ''));
+    if (url.pathname === '/api/ship') {
+      const s = F.getShip(q.get('mmsi'));
+      return s ? send(res, 200, s) : send(res, 404, { error: 'not heard recently' });
+    }
     if (url.pathname === '/api/flight') {
       const errors = [];
       const trace = await F.flightTrace(q.get('hex') || '').catch(err => { errors.push(err.message); return null; });
@@ -252,7 +287,7 @@ http.createServer(async (req, res) => {
 
     const file = normalize(join(PUBLIC, url.pathname === '/' ? 'index.html' : url.pathname));
     if (!file.startsWith(PUBLIC)) return send(res, 403, 'forbidden', 'text/plain');
-    send(res, 200, await readFile(file), MIME[extname(file)] || 'application/octet-stream');
+    await serveStatic(req, res, file);
   } catch (err) {
     if (err.code === 'ENOENT') return send(res, 404, 'not found', 'text/plain');
     console.error(err.message);

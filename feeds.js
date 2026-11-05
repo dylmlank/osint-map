@@ -121,25 +121,29 @@ export const regionKey = (lat, lon) => `${Math.round(lat)}:${Math.round(lon)}`;
 
 // Areas someone looked at recently are kept refreshed, so coming back (or reloading) is instant.
 const recentRegions = new Map(); // key -> last asked
-export function flightsNear(key) {
+// priority 'user' = the area someone is looking at right now; it skips ahead of background
+// work (hotspots, areas viewed earlier) in the rate-limit queue.
+export function flightsNear(key, priority = 'background') {
   recentRegions.set(key, Date.now());
-  return cached(`fl:${key}`, 6000, () => fetchRegion(key), 120000);
+  return cached(`fl:${key}`, 6000, () => fetchRegion(key, priority), 5 * 60 * 1000);
 }
 
-async function fetchRegion(key) {
+async function fetchRegion(key, priority = 'background') {
   const [la, lo] = key.split(':');
   // adsb.fi first (separate rate limit), adsb.lol as backup. Both serve the same readsb format.
-  const j = await adsbFi(`https://opendata.adsb.fi/api/v2/lat/${la}/lon/${lo}/dist/250`)
-    .catch(() => adsb(`https://api.adsb.lol/v2/point/${la}/${lo}/250`));
+  const j = await adsbFi(`https://opendata.adsb.fi/api/v2/lat/${la}/lon/${lo}/dist/250`, { priority })
+    .catch(() => adsb(`https://api.adsb.lol/v2/point/${la}/${lo}/250`, { priority }));
   const flights = (j?.ac || j?.aircraft || []).filter(a => a.lat != null).map(slimFlight);
   jammingTracker.record(flights);
   return flights;
 }
 
+// Areas viewed in the last 15 min stay warm. Areas someone is looking at right now are already
+// refreshed every 8 s by their live push, so this only tops up the others, once a minute.
 setInterval(() => {
   for (const [key, asked] of recentRegions) {
     if (Date.now() - asked > 15 * 60 * 1000) { recentRegions.delete(key); continue; }
-    cached(`fl:${key}`, 15000, () => fetchRegion(key)).catch(() => {});
+    cached(`fl:${key}`, 60000, () => fetchRegion(key)).catch(() => {});
   }
 }, 20000).unref();
 
@@ -348,6 +352,18 @@ export const CAMERA_PARSERS = {
     on: xmlField(i, 'offline') !== 'true', image: `https://trafficnz.info${xmlField(i, 'imageUrl')}`, source: 'NZ Transport Agency',
   })),
 
+  // WSDOT's public camera list (the one its mobile app uses): highways, passes, ferries, airports.
+  Washington: j => (j.cameras?.items || []).map(c => ({
+    name: c.title, place: 'Washington State', route: [c.roadName, c.direction && `facing ${c.direction}`].filter(Boolean).join(' · '),
+    lat: c.lat, lon: c.lon, on: Boolean(c.url), image: c.url, source: 'WSDOT',
+  })),
+
+  // Seattle city cameras. This list also repeats some WSDOT ones, which are skipped.
+  Seattle: j => (j.Features || []).flatMap(f => f.Cameras.filter(c => c.Type === 'sdot').map(c => ({
+    name: c.Description, place: 'Seattle', route: '', lat: f.PointCoordinate[0], lon: f.PointCoordinate[1],
+    on: Boolean(c.ImageUrl), image: `https://www.seattle.gov/trafficcams/images/${c.ImageUrl}`, source: 'Seattle DOT',
+  }))),
+
   Singapore: j => (j.items?.[0]?.cameras || []).map(c => ({
     name: `Camera ${c.camera_id}`, place: 'Singapore', route: '', lat: c.location.latitude, lon: c.location.longitude,
     on: true, image: c.image, source: 'Singapore LTA',
@@ -365,6 +381,8 @@ export const CAMERA_FETCH = {
   'Hong Kong': () => getText('https://static.data.gov.hk/td/traffic-snapshot-images/code/Traffic_Camera_Locations_En.xml'),
   Finland: () => getJSON('https://tie.digitraffic.fi/api/weathercam/v1/stations'),
   'New Zealand': () => getText('https://trafficnz.info/service/traffic/rest/4/cameras/all'),
+  Washington: () => getJSON('https://data.wsdot.wa.gov/mobile/Cameras.json'),
+  Seattle: () => getJSON('https://web.seattle.gov/Travelers/api/Map/Data?zoomId=13&type=2'),
   Singapore: () => getJSON('https://api.data.gov.sg/v1/transport/traffic-images'),
 };
 
@@ -563,14 +581,20 @@ let pruneShips = null;
 export const getShip = mmsi => ships.get(Number(mmsi)) || ships.get(String(mmsi));
 export const allShips = () => ships.values();
 
-export function shipsIn([w, s, e, n]) {
-  const out = [];
-  const fresh = Date.now() - 30 * 60 * 1000; // the live layer only shows ships heard in the last 30 min
+// Ships in a box, at most `limit` of them (moving ships first, since they're the interesting ones
+// when zoomed far out). The live layer only shows ships heard in the last 30 min.
+export function shipsIn([w, s, e, n], limit = 20000) {
+  const moving = [], still = [];
+  const fresh = Date.now() - 30 * 60 * 1000;
   for (const sh of ships.values()) {
     if (sh.lat == null || sh.lat < s || sh.lat > n || sh.seen < fresh) continue;
     if (w <= e ? (sh.lon < w || sh.lon > e) : (sh.lon < w && sh.lon > e)) continue;
-    out.push(sh);
-    if (out.length >= 20000) break;
+    ((sh.speed || 0) > 0.5 ? moving : still).push(sh);
   }
-  return out;
+  return moving.concat(still).slice(0, limit);
 }
+
+// Compact row sent to the browser (same layout the timeline records):
+// [mmsi, name, lat, lon, course, speed, type, sanctioned 0/1]. Full details load on click.
+export const shipRow = s => [s.mmsi, s.name || '', round(s.lat, 4), round(s.lon, 4),
+  Math.round(s.heading ?? s.course ?? 0), Math.round((s.speed || 0) * 10) / 10, s.type || 0, s.sanc ? 1 : 0];
