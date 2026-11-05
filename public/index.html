@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OSINT Map</title>
+  <script>
+    // Start downloading data right away, in parallel with the map libraries below.
+    (function () {
+      var on = { flights: 1, cameras: 1, news: 1, quakes: 1 };
+      try { var saved = JSON.parse(localStorage.getItem('osint-layers')); if (saved) on = saved; } catch (e) {}
+      var feeds = ['military', 'cameras', 'news', 'quakes', 'fires', 'events', 'alerts', 'cables', 'plants'];
+      window.prefetch = {};
+      feeds.forEach(function (f) {
+        if (on[f]) window.prefetch[f] = fetch('/api/' + f).then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; });
+      });
+    })();
+  </script>
+  <link rel="preconnect" href="https://basemaps.cartocdn.com" crossorigin>
+  <link rel="preconnect" href="https://tiles.basemaps.cartocdn.com" crossorigin>
+  <link rel="preload" as="script" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js">
+  <link rel="preload" as="script" href="https://unpkg.com/deck.gl@9.0.38/dist.min.js">
+  <link rel="preload" as="fetch" href="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json" crossorigin>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@400;600&display=swap" rel="stylesheet">
+  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
+  <link href="style.css" rel="stylesheet">
+</head>
+<body>
+  <div id="map"></div>
+
+  <aside id="panel">
+    <header>
+      <h1>OSINT<span>MAP</span></h1>
+      <div class="live mono"><i id="live-dot"></i><span id="clock"></span></div>
+    </header>
+    <div class="search">
+      <input id="search" type="search" placeholder="Search place, flight, ship, camera…" autocomplete="off" spellcheck="false">
+      <div id="results" hidden></div>
+    </div>
+    <div class="basemap" role="radiogroup" aria-label="Map style">
+      <button data-basemap="dark" role="radio">Dark map</button>
+      <button data-basemap="satellite" role="radio">Satellite</button>
+    </div>
+    <section class="watch">
+      <div class="watch-head">
+        <span class="group">Watchlist</span>
+        <button id="watch-area" title="Draw an area on the map to watch">+ Area</button>
+        <button id="alerts-btn" title="Alert history">Alerts <b id="unread" hidden>0</b></button>
+      </div>
+      <div id="watch-list"><p class="empty">Nothing watched yet. Draw an area, or open a flight or ship and press Watch.</p></div>
+    </section>
+    <div id="layers"></div>
+    <details class="key">
+      <summary>Color key</summary>
+      <div id="legend" class="legend"></div>
+    </details>
+    <p id="status" class="mono"></p>
+    <p class="sources">Sources: adsb.lol · aisstream.io · Caltrans · GDELT · USGS · NASA EONET · NIFC · NWS · RainViewer · TeleGeography · WRI · Esri · OpenStreetMap</p>
+  </aside>
+
+  <div id="toasts" aria-live="polite"></div>
+
+  <article id="card" hidden>
+    <button id="card-close" aria-label="Close">×</button>
+    <div id="card-body"></div>
+  </article>
+
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <script src="https://unpkg.com/deck.gl@9.0.38/dist.min.js"></script>
+  <script src="icons.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

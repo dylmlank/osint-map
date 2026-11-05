@@ -1,0 +1,13 @@
+{
+  "name": "osint-map",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Live map of flights, ships and traffic cameras from free public feeds",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
