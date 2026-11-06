@@ -16,6 +16,7 @@
     diamond: c => `<path fill="${c}" d="M12 1.5 22.5 12 12 22.5 1.5 12z"/>`,
     bolt: c => `<circle fill="${c}" cx="12" cy="12" r="10"/><path fill="${INK}" stroke="none" d="M13.2 4.5 7.5 13.2h4l-1 6.3 6-9h-4.1z"/>`,
     satellite: c => `<path fill="${c}" d="M1.5 9.5h6v5h-6zM16.5 9.5h6v5h-6z"/><rect fill="${c}" x="8.5" y="8" width="7" height="8" rx="1.5"/><path fill="none" stroke="${c}" stroke-width="2" d="M7.5 12h1M15.5 12h1"/>`,
+    alert: c => `<path fill="${c}" d="M12 2.2 22.6 20.8H1.4z"/><path fill="none" stroke="${INK}" stroke-width="2.4" stroke-linecap="round" d="M12 9v5.2"/><circle fill="${INK}" stroke="none" cx="12" cy="17.4" r="1.4"/>`,
     grid: c => `<rect fill="${c}" x="3" y="3" width="18" height="18" rx="2"/><path fill="none" stroke="${INK}" stroke-width="1.6" d="M3 12h18M12 3v18"/>`,
     airport: c => `<path fill="${c}" d="M12 22.5s-7.5-7.3-7.5-12.6a7.5 7.5 0 0 1 15 0c0 5.3-7.5 12.6-7.5 12.6z"/><circle fill="${INK}" stroke="none" cx="12" cy="9.9" r="2.8"/>`,
   };

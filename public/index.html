@@ -14,7 +14,7 @@
         var saved = JSON.parse(localStorage.getItem('osint-layers')); if (saved) on = saved;
         basemap = JSON.parse(localStorage.getItem('osint-basemap')) || 'dark';
       } catch (e) {}
-      var feeds = ['military', 'cameras', 'news', 'quakes', 'fires', 'events', 'alerts', 'cables', 'plants', 'sanctioned', 'dark', 'jamming'];
+      var feeds = ['military', 'cameras', 'news', 'quakes', 'fires', 'events', 'alerts', 'cables', 'plants', 'sanctioned', 'dark', 'jamming', 'shipwatch'];
       window.prefetch = {};
       feeds.forEach(function (f) {
         if (on[f]) window.prefetch[f] = fetch('/api/' + f).then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; });
@@ -58,7 +58,12 @@
     </div>
     <div class="basemap" role="radiogroup" aria-label="Map style">
       <button data-basemap="dark" role="radio">Dark map</button>
-      <button data-basemap="satellite" role="radio">Satellite</button>    </div>
+      <button data-basemap="satellite" role="radio">Satellite</button>
+    </div>
+    <div class="tools">
+      <button id="open-chokepoints" title="Ship traffic through the world's key straits and canals">Chokepoints</button>
+      <button id="open-riskiest" title="Ships with the highest risk scores right now">Riskiest ships</button>
+    </div>
     <section class="watch">
       <div class="watch-head">
         <span class="group">Watchlist</span>

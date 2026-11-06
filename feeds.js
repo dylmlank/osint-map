@@ -189,7 +189,157 @@ export async function sanctionedShips() {
   return out;
 }
 
-export const darkShips = async () => I.findDarkShips(ships.values());
+export async function darkShips() {
+  const dark = I.findDarkShips(ships.values());
+  for (const d of dark) {
+    // one entry per silent episode (an episode is identified by when the ship was last heard)
+    logShip(d.mmsi, { kind: 'dark', time: d.lastSeen, confidence: d.confidence, silentMin: d.silentMin, lat: d.lat, lon: d.lon }, `dark:${d.lastSeen}`, 24 * 60 * 60 * 1000);
+  }
+  return dark;
+}
+
+// ---------- suspicious ship behaviour (see intel.js) ----------
+// Position jumps and identity changes are noticed as messages arrive; transfers, cable
+// loitering and shared IMOs are worked out once a minute over all ships.
+const shipEvents = new Map(); // "kind:mmsi" -> event
+const EVENT_KEEP = { jump: 6 * 60 * 60 * 1000, identity: 24 * 60 * 60 * 1000 };
+function noteShipEvent(kind, s, details) {
+  const e = { kind, time: Date.now(), mmsi: s.mmsi, name: s.name || '', type: s.type || 0,
+    imo: s.imo || null, sanc: s.sanc || null, lat: s.lat, lon: s.lon, ...details };
+  shipEvents.set(`${kind}:${s.mmsi}`, e);
+  logShip(s.mmsi, kind === 'jump' ? { kind, time: e.time, distKm: e.distKm, minutes: e.minutes }
+    : { kind, time: e.time, field: e.field, from: e.from, to: e.to }, kind, 60 * 60 * 1000);
+}
+
+// ---------- ship history: event log, 24 h track, chokepoint transits ----------
+// Saved to data/ every few minutes so ship profiles and chokepoint "normals" survive restarts.
+const LOG_FILE = join(DATA_DIR, 'shiplog.json'), CHOKE_FILE = join(DATA_DIR, 'chokepoints.json');
+const readSaved = file => { try { return existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : null; } catch { return null; } };
+const shipLog = new Map(Object.entries(readSaved(LOG_FILE) || {})); // mmsi -> [{ kind, time, ... }] newest last
+const lastLogged = new Map(); // `${mmsi}:${key}` -> time (one entry per episode)
+const chokepoints = I.createChokepointCounter(readSaved(CHOKE_FILE) || {});
+const LOG_DAYS = 14;
+
+function logShip(mmsi, event, episodeKey, gapMs) {
+  const k = `${mmsi}:${episodeKey}`;
+  if (Date.now() - (lastLogged.get(k) || 0) < gapMs) return; // same episode, already logged
+  lastLogged.set(k, Date.now());
+  const list = shipLog.get(String(mmsi)) || [];
+  list.push(event);
+  shipLog.set(String(mmsi), list.slice(-40));
+}
+
+// Light 24 h track: a point every 10 min, or sooner if the ship moved 2 km+.
+function addTrailPoint(s, lat, lon, t) {
+  const tr = (s.trail ||= []);
+  const n = tr.length;
+  if (n && t - tr[n - 3] < 10 * 60 * 1000 && I.km({ lat: tr[n - 2], lon: tr[n - 1] }, { lat, lon }) < 2) return;
+  tr.push(t, round(lat, 4), round(lon, 4));
+  while (tr.length && t - tr[0] > 24 * 60 * 60 * 1000) tr.splice(0, 3);
+}
+
+function saveShipHistory() {
+  const cutoff = Date.now() - LOG_DAYS * 24 * 60 * 60 * 1000;
+  for (const [mmsi, list] of shipLog) {
+    const kept = list.filter(e => e.time > cutoff);
+    if (kept.length) shipLog.set(mmsi, kept); else shipLog.delete(mmsi);
+  }
+  for (const [k, t] of lastLogged) if (Date.now() - t > 24 * 60 * 60 * 1000) lastLogged.delete(k);
+  chokepoints.summary(); // also trims old days
+  mkdirSync(DATA_DIR, { recursive: true });
+  writeFileSync(LOG_FILE, JSON.stringify(Object.fromEntries(shipLog)));
+  writeFileSync(CHOKE_FILE, JSON.stringify(chokepoints.state));
+}
+setInterval(saveShipHistory, 5 * 60 * 1000).unref();
+
+// Flag countries from MMSI prefixes (ITU list via github.com/powers9/MIDs, Apache-2.0).
+let mids = readSaved(join(DATA_DIR, 'mids.json'));
+async function loadMids() {
+  if (mids) return;
+  mids = await getJSON('https://raw.githubusercontent.com/powers9/MIDs/master/mids.json');
+  mkdirSync(DATA_DIR, { recursive: true });
+  writeFileSync(join(DATA_DIR, 'mids.json'), JSON.stringify(mids));
+}
+
+const shipEventsFor = mmsi => shipLog.get(String(mmsi)) || [];
+
+// Everything about one ship, for its profile page.
+export async function shipProfile(mmsi) {
+  await loadMids().catch(() => {});
+  const s = getShip(mmsi);
+  const events = shipEventsFor(mmsi);
+  if (!s && !events.length) return null;
+  const ship = s ? { ...s, trail: undefined } : { mmsi: Number(mmsi) };
+  const flag = I.flagOf(mmsi, mids);
+  const tr = s?.trail || [];
+  const trail = [];
+  for (let i = 0; i < tr.length; i += 3) trail.push([tr[i + 2], tr[i + 1], tr[i]]); // [lon, lat, time]
+  return { ship, flag, trail, events: [...events].reverse(), risk: I.shipRisk(ship, events, { flag }) };
+}
+
+// The ships with the highest risk scores right now (only ships with something on record).
+export async function riskiestShips(limit = 25) {
+  await loadMids().catch(() => {});
+  const candidates = new Set([...shipLog.keys()]);
+  for (const s of ships.values()) if (s.sanc) candidates.add(String(s.mmsi));
+  const out = [];
+  for (const mmsi of candidates) {
+    const s = getShip(mmsi);
+    if (!s || s.lat == null) continue;
+    const flag = I.flagOf(mmsi, mids);
+    const risk = I.shipRisk(s, shipEventsFor(mmsi), { flag });
+    if (risk.score >= 20) out.push({ mmsi: s.mmsi, name: s.name, type: s.type, lat: s.lat, lon: s.lon, flag, score: risk.score, level: risk.level, top: risk.reasons[0]?.text || '' });
+  }
+  return out.sort((a, b) => b.score - a.score).slice(0, limit);
+}
+
+// Chokepoint traffic, plus how many ships the receivers can hear near each one right now
+// (low numbers mean poor coverage, so the counts there are incomplete).
+export async function chokepointTraffic() {
+  const now = Date.now();
+  const summary = chokepoints.summary(now);
+  for (const g of summary) {
+    const mid = { lon: (g.line[0][0] + g.line[1][0]) / 2, lat: (g.line[0][1] + g.line[1][1]) / 2 };
+    let heard = 0;
+    for (const s of ships.values()) if (s.lat != null && now - s.seen < 30 * 60 * 1000 && Math.abs(s.lat - mid.lat) < 1 && Math.abs(s.lon - mid.lon) < 1 && I.km(s, mid) < 60) heard++;
+    g.heardNow = heard;
+  }
+  return { since: chokepoints.state.since, gates: summary };
+}
+
+let cableIndex = null, portIndex = null;
+const stsTracker = I.createStsTracker();
+const cableWatch = I.createCableWatch();
+
+async function loadPorts() {
+  const j = await getJSON('https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_10m_ports.geojson');
+  portIndex = I.buildPortIndex(j.features.map(f => ({ name: f.properties.name, lon: f.geometry.coordinates[0], lat: f.geometry.coordinates[1] })));
+}
+
+export async function shipDetections() {
+  if (!portIndex) await loadPorts().catch(err => console.warn(`[ships] ports list: ${err.message}`));
+  const now = Date.now(), list = [...ships.values()];
+  const out = [];
+  const SIX_H = 6 * 60 * 60 * 1000;
+  for (const p of stsTracker.update(list, now, portIndex)) {
+    out.push({ kind: 'sts', time: now, ...p });
+    for (const [me, other] of [[p.a, p.b], [p.b, p.a]]) {
+      logShip(me.mmsi, { kind: 'sts', time: now, partner: other.name || String(other.mmsi), partnerMmsi: other.mmsi, partnerSanctioned: Boolean(other.sanc), lat: p.lat, lon: p.lon }, `sts:${other.mmsi}`, SIX_H);
+    }
+  }
+  if (cableIndex) for (const c of cableWatch.update(list, now, cableIndex, portIndex)) {
+    out.push({ kind: 'cable', time: now, ...c });
+    logShip(c.mmsi, { kind: 'cable', time: now, cable: c.cable, minutes: c.minutes, lat: c.lat, lon: c.lon }, `cable:${c.cable}`, SIX_H);
+  }
+  for (const c of I.findSharedImo(list, now)) {
+    out.push({ kind: 'clone', time: now, ...c });
+    for (const s of c.ships) logShip(s.mmsi, { kind: 'clone', time: now, imo: c.imo, km: c.km }, `clone:${c.imo}`, 24 * 60 * 60 * 1000);
+  }
+  for (const [key, e] of shipEvents) {
+    if (now - e.time > EVENT_KEEP[e.kind]) shipEvents.delete(key); else out.push(e);
+  }
+  return out;
+}
 
 // ---------- satellites (CelesTrak orbital elements) ----------
 // CelesTrak updates every few hours and asks users not to download more often, so groups are
@@ -512,6 +662,7 @@ export async function cables() {
     f.geometry.coordinates = roundCoords(f.geometry.coordinates);
     f.properties = { name: f.properties.name, color: f.properties.color, id: f.properties.id };
   }
+  cableIndex = I.buildCableIndex(j); // for the cable-loitering check
   return j;
 }
 
@@ -556,11 +707,38 @@ export function connectAIS(key) {
     const s = ships.get(id) || { mmsi: id };
     s.name = (meta.ShipName || s.name || '').trim();
     const pos = m.Message?.PositionReport || m.Message?.StandardClassBPositionReport;
-    if (pos) Object.assign(s, { lat: meta.latitude, lon: meta.longitude, speed: pos.Sog, course: pos.Cog,
-      heading: pos.TrueHeading === 511 ? pos.Cog : pos.TrueHeading, seen: Date.now() });
+    // 91/181 means "position not available"; 0,0 is a common bad fix. Neither is a real position.
+    const lat = meta.latitude, lon = meta.longitude;
+    const validPos = Math.abs(lat) <= 90 && Math.abs(lon) <= 180 && !(lat === 0 && lon === 0);
+    if (pos && validPos) {
+      const now = Date.now();
+      // When the ship sent it (relayed reports can arrive late or out of order). Jumps are judged
+      // on this, so a late report doesn't look like teleporting.
+      const tm = String(meta.time_utc || '').match(/^(\d{4}-\d\d-\d\d) (\d\d:\d\d:\d\d(?:\.\d{1,3})?)/); // "2026-11-06 05:47:05.123456789 +0000 UTC"
+      const sent = (tm && Date.parse(`${tm[1]}T${tm[2]}Z`)) || now;
+      if (I.validMmsi(id)) {
+        if (sent < (s.sentAt || 0)) { ships.set(id, s); return; } // older than what we have: ignore
+        const prev = { lat: s.lat, lon: s.lon, t: s.sentAt }, cur = { lat, lon, t: sent, speed: pos.Sog };
+        const jump = I.checkJump(prev, cur);
+        if (jump) noteShipEvent('jump', s, { ...jump, fromLat: s.lat, fromLon: s.lon, lat, lon });
+        else {
+          for (const t of chokepoints.record(s, prev, cur, sent)) {
+            logShip(s.mmsi, { kind: 'transit', time: sent, gate: t.gate, dir: I.CHOKEPOINTS.find(g => g.id === t.gate).dirs[t.dir] }, `transit:${t.gate}`, 30 * 60 * 1000);
+          }
+          addTrailPoint(s, lat, lon, sent);
+        }
+      }
+      Object.assign(s, { lat, lon, speed: pos.Sog, course: pos.Cog,
+        heading: pos.TrueHeading === 511 ? pos.Cog : pos.TrueHeading, seen: now, sentAt: sent });
+    }
     const st = m.Message?.ShipStaticData;
-    if (st) Object.assign(s, { type: st.Type, dest: (st.Destination || '').trim(), imo: st.ImoNumber || undefined,
-      length: (st.Dimension?.A || 0) + (st.Dimension?.B || 0) });
+    if (st) {
+      const next = { name: (st.Name || '').trim(), imo: st.ImoNumber || undefined };
+      const change = s.staticName !== undefined && I.validMmsi(id) ? I.identityChange({ name: s.staticName, imo: s.imo }, next) : null;
+      if (change && s.lat != null) noteShipEvent('identity', s, change);
+      Object.assign(s, { type: st.Type, dest: (st.Destination || '').trim(), imo: next.imo, staticName: next.name,
+        length: (st.Dimension?.A || 0) + (st.Dimension?.B || 0) });
+    }
     if (st || !ships.has(id)) s.sanc = I.matchShip(sanctionsIndex, s);
     ships.set(id, s);
   };

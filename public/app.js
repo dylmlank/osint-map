@@ -8,6 +8,8 @@ const C = {
   camera: '#e879f9', fire: '#f97316', alert: '#f472b6', radar: '#60a5fa', cable: '#2dd4bf',
   track: '#22d3ee', sanction: '#ff1744', dark: '#fbbf24', darkLow: '#a8a29e',
 };
+// Suspicious ship activity, by kind of detection.
+const SHIPWATCH = { sts: '#f472b6', cable: '#2dd4bf', jump: '#a78bfa', identity: '#facc15', clone: '#ef4444' };
 const SAT = { stations: '#fde047', 'gps-ops': '#4ade80', weather: '#60a5fa', military: '#ef4444', geo: '#c084fc', starlink: '#94a3b8' };
 const SHIP = { Cargo: '#4ade80', Tanker: '#fb7185', Passenger: '#c084fc', Fishing: '#facc15', Service: '#fdba74', Other: '#94a3b8' };
 const NEWS = { violence: '#ef4444', protest: '#fb923c', tension: '#facc15', other: '#94a3b8' };
@@ -41,6 +43,8 @@ const LAYERS = [
   { id: 'sanctioned', group: 'Intelligence', label: 'Sanctioned ships (world)', icon: ['ship', C.sanction], kind: 'feed' },
   { id: 'dark',       group: 'Intelligence', label: 'Ships gone silent',    icon: ['ship', C.dark],       kind: 'feed' },
   { id: 'jamming',    group: 'Intelligence', label: 'GPS jamming (last hour)', icon: ['grid', '#ef4444'], kind: 'feed' },
+  { id: 'shipwatch',  group: 'Intelligence', label: 'Suspicious ship activity', icon: ['alert', '#f472b6'], kind: 'feed' },
+  { id: 'chokepoints', group: 'Intelligence', label: 'Chokepoint gates',     icon: ['grid', '#38bdf8'],  kind: 'feed' },
   { id: 'satellites', group: 'Space',        label: 'Satellites',           icon: ['satellite', '#fde047'], kind: 'sat' },
   { id: 'starlink',   group: 'Space',        label: 'Starlink',             icon: ['satellite', '#94a3b8'], kind: 'sat' },
 ];
@@ -49,7 +53,7 @@ const LAYERS = [
 const EVERY = {
   flights: 8, military: 15, ships: 5, cameras: 600, news: 900, quakes: 60, events: 900,
   fires: 300, alerts: 120, radar: 600, cables: 86400, plants: 86400,
-  sanctioned: 60, dark: 60, jamming: 60, satellites: 21600, starlink: 21600,
+  sanctioned: 60, dark: 60, jamming: 60, shipwatch: 60, chokepoints: 60, satellites: 21600, starlink: 21600,
 };
 
 const LEGEND = [
@@ -68,7 +72,10 @@ const LEGEND = [
   ['airport', '#22d3ee', 'Departure'], ['airport', '#f472b6', 'Destination'],
   ['ship', C.sanction, 'Sanctioned (red ring)'], ['ship', C.dark, 'Silent, likely switched off'],
   ['ship', C.darkLow, 'Silent, maybe out of range'], ['grid', '#ef4444', 'GPS jamming 10%+'],
-  ['grid', '#facc15', 'GPS jamming 5–10%'], ['satellite', SAT.stations, 'Space station'],
+  ['grid', '#facc15', 'GPS jamming 5–10%'],
+  ['alert', SHIPWATCH.sts, 'Ship-to-ship transfer'], ['alert', SHIPWATCH.cable, 'Loitering over a cable'],
+  ['alert', SHIPWATCH.jump, 'Impossible jump'], ['alert', SHIPWATCH.identity, 'Changed identity'],
+  ['alert', SHIPWATCH.clone, 'Shared IMO number'], ['satellite', SAT.stations, 'Space station'],
   ['satellite', SAT['gps-ops'], 'GPS'], ['satellite', SAT.weather, 'Weather'],
   ['satellite', SAT.military, 'Military sat'], ['satellite', SAT.geo, 'Geostationary'],
 ];
@@ -197,6 +204,7 @@ const COUNT = {
   alerts: d => d.features.length,
   cables: d => d.features.length,
   jamming: d => d.filter(c => c.level === 'high').length, // areas with strong signs of jamming
+  chokepoints: d => d.gates.reduce((s, g) => s + g.last24, 0), // crossings in the last 24 h
 };
 
 function accept(id, json) {
@@ -278,6 +286,70 @@ function planeColor(f) {
   if (f.alt === 'ground') return C.planeGround;
   const a = +f.alt || 0;
   return a < 10000 ? C.planeLow : a < 25000 ? C.planeMid : C.planeHigh;
+}
+
+// ---------- suspicious ship activity ----------
+const SHIPWATCH_NAME = { sts: 'Possible ship-to-ship transfer', cable: 'Loitering over an undersea cable',
+  jump: 'Impossible position jump', identity: 'Changed identity', clone: 'Two ships, one IMO number' };
+const shipLabel = s => s.name || `MMSI ${s.mmsi}`;
+
+function shipwatchTitle(d) {
+  const who = d.kind === 'sts' ? `${shipLabel(d.a)} + ${shipLabel(d.b)}` : d.kind === 'clone' ? `IMO ${d.imo}` : shipLabel(d);
+  return `${SHIPWATCH_NAME[d.kind]}: ${who}`;
+}
+
+// Icons plus a connecting line: the two ships in a transfer, where a jump came from,
+// or how far a ship has moved along a cable.
+function shipwatchLayers(list) {
+  const lines = [];
+  for (const d of list) {
+    if (d.kind === 'sts') lines.push({ d, path: [[d.a.lon, d.a.lat], [d.b.lon, d.b.lat]] });
+    if (d.kind === 'jump' && d.fromLat != null) lines.push({ d, path: [[d.fromLon, d.fromLat], [d.lon, d.lat]] });
+    if (d.kind === 'cable' && d.startLat != null) lines.push({ d, path: [[d.startLon, d.startLat], [d.lon, d.lat]] });
+    if (d.kind === 'clone') for (let i = 1; i < d.ships.length; i++) lines.push({ d, path: [[d.ships[0].lon, d.ships[0].lat], [d.ships[i].lon, d.ships[i].lat]] });
+  }
+  return [
+    new PathLayer({
+      id: 'shipwatch-lines', data: lines, getPath: l => l.path, widthUnits: 'pixels', getWidth: 2,
+      getColor: l => [...rgb(SHIPWATCH[l.d.kind]), l.d.kind === 'clone' || l.d.kind === 'jump' ? 120 : 220],
+    }),
+    icons('shipwatch', { shape: 'alert', color: d => SHIPWATCH[d.kind], size: 22 }),
+  ];
+}
+
+function shipwatchShip(s, label) {
+  return `<div class="route"><b style="font-size:14px">${esc(label ? `${label}: ` : '')}${esc(shipLabel(s))}</b>
+    ${s.sanc ? '<span class="flag emg">SANCTIONED</span>' : ''}
+    <small>${esc([shipType(s.type), s.length ? `${s.length} m` : '', s.imo ? `IMO ${s.imo}` : '', `MMSI ${s.mmsi}`].filter(Boolean).join(' · '))}</small>
+    <small><a href="#" data-profile="${esc(s.mmsi)}">Profile &amp; risk →</a></small></div>`;
+}
+
+function shipwatchCard(d) {
+  const head = `<h2>${esc(SHIPWATCH_NAME[d.kind])}</h2><div class="sub">Detected ${ago(d.time)} · from public ship tracking (AIS)</div>`;
+  if (d.kind === 'sts') {
+    return `${head}${shipwatchShip(d.a)}${shipwatchShip(d.b)}
+      ${rows([['Together for', `${d.minutes} min`], ['Distance apart', `${d.distM} m`], ['Speeds', `${d.a.speed} kt / ${d.b.speed} kt`], ['Position', pos2(d.lat, d.lon)]])}
+      <p class="sub">Two ships this close, barely moving and away from any major port for over an hour is how cargo (often oil) is moved from one ship to another at sea. It's legal in many places, but it's also how sanctioned oil changes hands. Check the flags, owners and sanctions status of both ships.</p>`;
+  }
+  if (d.kind === 'cable') {
+    return `${head}${shipwatchShip(d)}
+      ${rows([['Cable', d.cable], ['Distance from cable', `${d.cableM} m`], ['Over the cable for', `${d.minutes} min`], ['Moved along it', `${d.alongKm} km`],
+        ['Speed', `${d.speed} kt (${d.mode})`], ['Position', pos2(d.lat, d.lon)]])}
+      <p class="sub">Ships normally cross a cable in a few minutes. Staying slow on top of one for half an hour or more matches the pattern of the Baltic cable cuts, where ships dragged their anchors along the seabed. It can also be innocent (waiting, fishing, cable repair ships), so check the ship type and history.</p>`;
+  }
+  if (d.kind === 'jump') {
+    return `${head}${shipwatchShip(d)}
+      ${rows([['Jumped', `${d.distKm} km in ${d.minutes} min`], ['Would need', `${d.impliedKn} kt`], ['From', pos2(d.fromLat, d.fromLon)], ['To', pos2(d.lat, d.lon)]])}
+      <p class="sub">No ship can move that fast. Usually it means two transmitters are using the same MMSI number (by mistake, or one is borrowing an identity), or the position is being faked to hide where the ship really is.</p>`;
+  }
+  if (d.kind === 'identity') {
+    return `${head}${shipwatchShip(d)}
+      ${rows([['Changed', d.field], ['Before', d.from], ['After', d.to], ['Position', pos2(d.lat, d.lon)]])}
+      <p class="sub">A ship's ${d.field === 'IMO' ? 'IMO number is permanent, so a change is a strong sign of a fake identity' : 'name can change legitimately (new owner), but a change at sea, mid-voyage, is unusual and worth checking'}.</p>`;
+  }
+  return `${head}${d.ships.map((s, i) => shipwatchShip(s, `Ship ${i + 1}`)).join('')}
+    ${rows([['Shared IMO', d.imo], ['Distance apart', `${d.km.toLocaleString()} km`]])}
+    <p class="sub">An IMO number belongs to one hull for its whole life. Two ships broadcasting it ${d.km.toLocaleString()} km apart means at least one is using a borrowed or fake identity (or someone typed it wrong).</p>`;
 }
 
 const SHIP_TYPES = { 30: 'Fishing', 31: 'Towing', 32: 'Towing', 33: 'Dredging', 34: 'Diving', 35: 'Military', 36: 'Sailing',
@@ -437,6 +509,9 @@ function render() {
   if (show('sanctioned')) L.push(icons('sanctioned', {
     shape: 'ship', color: C.sanction, size: 20, angle: d => -(d.heading ?? d.course ?? 0),
   }));
+  if (show('shipwatch')) L.push(...shipwatchLayers(V.shipwatch));
+  if (on.chokepoints && data.chokepoints) L.push(gateLayer(data.chokepoints.gates));
+  if (profileTrail) L.push(...profileLayers());
   L.push(sanctionRings());
   if (show('satellites')) L.push(icons('satellites', {
     shape: 'satellite', color: d => SAT[d.group] || '#e2e8f0', size: d => (d.iss ? 28 : d.group === 'stations' ? 20 : 14),
@@ -475,6 +550,10 @@ function tooltip({ object, layer }) {
     : id === 'sanctioned' ? `SANCTIONED: ${object.name || `MMSI ${object.mmsi}`}`
     : id === 'dark' ? `${object.name || `MMSI ${object.mmsi}`} · silent ${object.silentMin} min`
     : id === 'jamming' ? `${object.properties.pct}% of ${object.properties.n} aircraft with poor GPS`
+    : id === 'shipwatch' ? shipwatchTitle(object)
+    : id === 'chokepoints' ? `${object.name}: ${object.last24} ships in 24 h${object.vsNormal != null ? ` (${object.vsNormal > 0 ? '+' : ''}${object.vsNormal}% vs normal)` : ''}`
+    : id === 'profile-events' || id === 'profile-trail' ? null
+    : id === 'shipwatch-lines' ? null
     : id === 'satellites' || id === 'starlink' ? `${object.name} · ${Math.round(object.alt).toLocaleString()} km up`
     : id === 'sanction-rings' || id === 'dark-projection' || id === 'sat-track' ? null
     : id === 'watch-areas' ? (object.properties.draft ? null : `Watching: ${object.properties.label}`)
@@ -697,11 +776,14 @@ function closeCard() {
 }
 document.getElementById('card-close').onclick = closeCard;
 
+const WIDE_CARDS = new Set(['profile', 'chokepoints', 'riskiest']);
 function openCard(kind, html, keepScroll = false) {
   const scroll = card.scrollTop;
   if (cardKind !== kind || !keepScroll) closeCard();
+  if (kind !== 'profile' && profileTrail) { profileTrail = null; render(); } // the profile's track goes with its card
   cardKind = kind;
   card.hidden = false;
+  card.classList.toggle('wide', WIDE_CARDS.has(kind));
   cardBody.innerHTML = html;
   if (keepScroll) card.scrollTop = scroll;
 }
@@ -723,7 +805,7 @@ const CARDS = {
     ${rows([['Type', shipType(d.type)], ['Destination', d.dest], ['Length', d.length ? `${d.length} m` : ''],
       ['Speed', d.speed != null ? `${d.speed} kt` : ''], ['Course', d.course != null ? `${Math.round(d.course)}°` : ''],
       ['Last heard', d.seen ? ago(d.seen) : ''], ['Position', pos2(d.lat, d.lon)]])}
-    <div class="actions">${watchButton(findWatch('ship', d.mmsi))}</div>`,
+    <div class="actions">${watchButton(findWatch('ship', d.mmsi))}<button data-profile="${esc(d.mmsi)}">Profile &amp; risk</button></div>`,
 
   cameras: d => `<h2>${esc(d.name)}</h2>
     <div class="sub">${[d.place, d.route, d.source].filter(Boolean).map(esc).join(' · ')}</div>
@@ -773,6 +855,8 @@ const CARDS = {
     ${sanctionBlock(d.sanc)}
     ${rows([['Type', shipType(d.type)], ['Destination', d.dest], ['Last speed', `${d.speed} kt`], ['Last course', `${Math.round(d.course || 0)}°`],
       ['Last heard', ago(d.lastSeen)], ['Last position', pos2(d.lat, d.lon)]])}`,
+
+  shipwatch: d => shipwatchCard(d),
 
   jamming: d => `<h2>GPS ${d.level === 'high' ? 'jamming likely' : d.level === 'medium' ? 'interference possible' : 'looks normal'}</h2>
     <div class="sub">${d.lat}…${d.lat + d.size}°, ${d.lon}…${d.lon + d.size}° · last hour</div>
@@ -1146,6 +1230,7 @@ const ALERT_ICON = {
   flight: ['plane', C.planeLow], military: ['plane', C.military], emergency: ['plane', C.emergency],
   ship: ['ship', SHIP.Cargo], dark: ['ship', '#fbbf24'], quake: ['quake', '#f97316'], fire: ['fire', C.fire],
   event: ['storm', '#a78bfa'], news: ['news', NEWS.violence], info: ['diamond', C.track], error: ['diamond', '#ef4444'],
+  shipwatch: ['alert', SHIPWATCH.sts], sanctioned: ['ship', C.sanction],
 };
 const alertIcon = a => ALERT_ICON[a.kind] || ALERT_ICON.info;
 
@@ -1321,6 +1406,153 @@ function satCard(d) {
       ['Orbit', `once every ${Math.round(d.rec.period)} min`], ['Inclination', `${d.rec.incl.toFixed(1)}°`], ['Over', pos2(d.lat, d.lon)]])}
     <p class="sub">The line is its path over the ground, from 45 minutes ago to 90 minutes ahead. Positions are calculated from published orbit data and drift slowly between updates.</p>`;
 }
+
+// ---------- ship risk profiles ----------
+let profileTrail = null; // { path: [[lon, lat, t]...], events: [...] } drawn while a profile is open
+const EVENT_ICON = {
+  sts: ['alert', SHIPWATCH.sts], cable: ['alert', SHIPWATCH.cable], jump: ['alert', SHIPWATCH.jump],
+  identity: ['alert', SHIPWATCH.identity], clone: ['alert', SHIPWATCH.clone], dark: ['ship', C.dark], transit: ['grid', '#38bdf8'],
+};
+function eventText(e) {
+  switch (e.kind) {
+    case 'sts': return `Ship-to-ship transfer with ${esc(e.partner)}${e.partnerSanctioned ? ' <span class="flag emg">SANCTIONED</span>' : ''}`;
+    case 'cable': return `Loitered over the ${esc(e.cable)} cable (${e.minutes}+ min)`;
+    case 'jump': return `Impossible jump: ${e.distKm} km in ${e.minutes} min`;
+    case 'identity': return `Changed ${esc(e.field)}: ${esc(e.from)} → ${esc(e.to)}`;
+    case 'clone': return `Same IMO (${esc(e.imo)}) seen on another ship ${Number(e.km).toLocaleString()} km away`;
+    case 'dark': return `Went silent for ${e.silentMin}+ min (${e.confidence === 'high' ? 'likely switched off' : 'maybe out of range'})`;
+    case 'transit': return `Passed the ${esc(I_CHOKE_NAME[e.gate] || e.gate)} ${esc(e.dir || '')}`;
+    default: return esc(e.kind);
+  }
+}
+const I_CHOKE_NAME = {}; // filled from the chokepoint feed
+
+const riskChip = r => `<span class="chip ${r.level}">${r.score}/100</span>`;
+
+async function openProfile(mmsi) {
+  openCard('profile', '<h2>Loading ship profile…</h2>');
+  let p;
+  try { p = await api('GET', `/api/ship/profile?mmsi=${encodeURIComponent(mmsi)}`); }
+  catch { openCard('profile', '<h2>No record of this ship</h2><p class="sub">It hasn\'t been heard since the server started.</p>'); return; }
+  const s = p.ship;
+  profileTrail = { path: p.trail, events: p.events.filter(e => e.lat != null) };
+  if (p.trail.length > 1) {
+    const lons = p.trail.map(t => t[0]), lats = p.trail.map(t => t[1]);
+    map.fitBounds([[Math.min(...lons), Math.min(...lats)], [Math.max(...lons), Math.max(...lats)]], { padding: { left: 340, right: 600, top: 80, bottom: 120 }, maxZoom: 10 });
+  } else if (s.lat != null) map.flyTo({ center: [s.lon, s.lat], zoom: 8 });
+  render();
+  const lookup = s.imo ? `https://www.vesselfinder.com/vessels/details/${encodeURIComponent(s.imo)}` : `https://www.vesselfinder.com/vessels?name=${encodeURIComponent(s.mmsi)}`;
+  openCard('profile', `<h2>${esc(s.name || `MMSI ${s.mmsi}`)}${s.sanc ? '<span class="flag emg">SANCTIONED</span>' : ''}</h2>
+    <div class="sub">${esc([p.flag ? `${p.flag.name} flag` : 'flag unknown', shipType(s.type), s.length ? `${s.length} m` : '', s.imo ? `IMO ${s.imo}` : 'no IMO', `MMSI ${s.mmsi}`].filter(Boolean).join(' · '))}</div>
+    <div class="risk ${p.risk.level}">
+      <div class="score">${p.risk.score}<small style="display:block;font-size:11px;color:var(--muted)">${p.risk.level}</small></div>
+      ${p.risk.reasons.length ? `<ul>${p.risk.reasons.map(r => `<li><b>+${r.points}</b>${esc(r.text)}</li>`).join('')}</ul>` : '<ul><li>Nothing unusual on record in the last 7 days.</li></ul>'}
+    </div>
+    ${sanctionBlock(s.sanc)}
+    ${rows([['Destination', s.dest], ['Speed', s.speed != null ? `${s.speed} kt` : ''], ['Last heard', s.seen ? ago(s.seen) : ''], ['Position', s.lat != null ? pos2(s.lat, s.lon) : ''],
+      ['Track on map', p.trail.length > 1 ? `last ${Math.round((p.trail.at(-1)[2] - p.trail[0][2]) / 3600000 * 10) / 10} h (${p.trail.length} points)` : 'not enough yet']])}
+    <div class="sub" style="margin-top:12px">History (last 14 days, newest first)</div>
+    ${p.events.length ? `<ul class="timeline">${p.events.map(e => `<li><img src="${Icons.url(...(EVENT_ICON[e.kind] || ['diamond', '#94a3b8']))}" alt=""><span>${eventText(e)}</span><small>${ago(e.time)}</small></li>`).join('')}</ul>` : '<p class="sub">Nothing recorded yet. Events are logged from when the server started watching.</p>'}
+    <div class="actions">${watchButton(findWatch('ship', s.mmsi))}</div>
+    ${link(lookup, 'Look it up on VesselFinder (photos, owner, history)')}
+    <p class="sub">The score sorts ships worth a closer look; it isn't a verdict. It only counts what this map has seen, and public ship tracking has gaps.</p>`);
+  document.getElementById('watch-toggle').onclick = async () => {
+    await toggleWatch(findWatch('ship', s.mmsi), { type: 'ship', mmsi: s.mmsi, label: s.name || `MMSI ${s.mmsi}` });
+    openProfile(s.mmsi);
+  };
+}
+
+function profileLayers() {
+  const pts = profileTrail.path;
+  return [
+    new PathLayer({ id: 'profile-trail', data: pts.length > 1 ? [{ path: pts.map(p => [p[0], p[1]]) }] : [], getPath: d => d.path,
+      getColor: [...rgb(C.track), 220], getWidth: 3, widthUnits: 'pixels', jointRounded: true, capRounded: true }),
+    new IconLayer({ id: 'profile-events', data: profileTrail.events, getPosition: e => [e.lon, e.lat], pickable: true,
+      getIcon: e => Icons.icon(...(EVENT_ICON[e.kind] || ['diamond', '#94a3b8'])), getSize: 20, sizeUnits: 'pixels' }),
+  ];
+}
+
+// Any "Profile & risk" link or button, on any card.
+cardBody.addEventListener('click', e => {
+  const el = e.target.closest('[data-profile]');
+  if (!el) return;
+  e.preventDefault();
+  openProfile(el.dataset.profile);
+});
+
+// ---------- riskiest ships ----------
+document.getElementById('open-riskiest').addEventListener('click', async () => {
+  openCard('riskiest', '<h2>Loading…</h2>');
+  let list = [];
+  try { list = await api('GET', '/api/riskiest'); } catch { /* shown as empty */ }
+  openCard('riskiest', `<h2>Riskiest ships right now</h2>
+    <div class="sub">Ships currently heard, ranked by risk score. Only ships with something on record appear.</div>
+    ${list.length ? `<ul class="timeline">${list.map(s => `<li><img src="${Icons.url('ship', s.level === 'high' ? '#ef4444' : '#facc15')}" alt="">
+      <span><a href="#" data-profile="${esc(s.mmsi)}">${esc(s.name || `MMSI ${s.mmsi}`)}</a>${riskChip(s)}<br><small>${esc(s.top)}</small></span>
+      <small>${esc(s.flag?.name || '')}</small></li>`).join('')}</ul>`
+      : '<p class="sub">Nothing scores 20 or more yet. Scores build up as the server watches ships: sanctions matches show at once, transfers and silent periods take hours to appear.</p>'}`);
+});
+
+// ---------- chokepoints ----------
+const gateColor = g => (g.vsNormal == null ? [56, 189, 248] : g.vsNormal <= -25 ? [239, 68, 68] : g.vsNormal >= 25 ? [74, 222, 128] : [56, 189, 248]);
+
+function gateLayer(gates) {
+  for (const g of gates) I_CHOKE_NAME[g.id] = g.name;
+  return new PathLayer({
+    id: 'chokepoints', data: gates, getPath: g => g.line, pickable: true, widthUnits: 'pixels', getWidth: 4,
+    getColor: g => [...gateColor(g), 230], capRounded: true,
+    onClick: ({ object }) => openChokepoints(object.id),
+  });
+}
+
+function sparkline(series) {
+  const vals = series.map(d => d.total);
+  const known = vals.filter(v => v != null);
+  if (known.length < 2) return '<span class="muted">—</span>';
+  const max = Math.max(...known, 1), w = 90, h = 22, step = w / (vals.length - 1);
+  const pts = vals.map((v, i) => (v == null ? null : `${(i * step).toFixed(1)},${(h - 2 - (v / max) * (h - 4)).toFixed(1)}`)).filter(Boolean);
+  return `<svg class="spark" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}"><polyline fill="none" stroke="#38bdf8" stroke-width="1.5" points="${pts.join(' ')}"/></svg>`;
+}
+
+async function openChokepoints(focusId) {
+  if (!data.chokepoints) { openCard('chokepoints', '<h2>Loading…</h2>'); await loadFeed('chokepoints'); }
+  const c = data.chokepoints;
+  if (!c) return;
+  for (const g of c.gates) I_CHOKE_NAME[g.id] = g.name;
+  if (!on.chokepoints) { document.querySelector('[data-layer=chokepoints]').click(); }
+  const vs = g => (g.vsNormal == null ? `<span class="muted">baseline ${g.baselineDays}/3 days</span>`
+    : `<span class="${g.vsNormal < 0 ? 'down' : 'up'}">${g.vsNormal > 0 ? '+' : ''}${g.vsNormal}%</span>`);
+  const coverage = g => (g.heardNow >= 10 ? '' : ' <span class="muted" title="Few ships heard here right now, so counts are incomplete">⚠ thin coverage</span>');
+  openCard('chokepoints', `<h2>Chokepoint traffic</h2>
+    <div class="sub">Ships crossing a line across each strait, last 24 h. Counting since ${new Date(c.since).toLocaleString()}. Click a row to go there.</div>
+    <table class="choke">
+      <tr><th>Chokepoint</th><th>24 h</th><th>vs normal</th><th>Tankers</th><th>Each way</th><th>14 days</th></tr>
+      ${c.gates.map(g => `<tr data-gate="${g.id}"${g.id === focusId ? ' style="outline:1px solid var(--accent)"' : ''}>
+        <td><b>${esc(g.name)}</b>${coverage(g)}<br><small class="muted">${esc(g.note)}</small></td>
+        <td class="num">${g.last24}</td><td class="num">${vs(g)}</td>
+        <td class="num">${g.tankers24}${g.sanctioned24 ? ` <span class="flag emg" title="sanctioned ships">${g.sanctioned24}</span>` : ''}</td>
+        <td class="num" title="${esc(g.dirs[0])} / ${esc(g.dirs[1])}">${g.dir24[0]} / ${g.dir24[1]}</td>
+        <td>${sparkline(g.series)}</td></tr>`).join('')}
+    </table>
+    ${focusId ? chokeDetail(c.gates.find(g => g.id === focusId)) : ''}
+    <p class="sub">"Normal" is the median of earlier full days, so it appears after 3 days of counting. A big drop can mean a closure, an attack or rerouting (Red Sea traffic shifted to the Cape of Good Hope in 2024). "Thin coverage" means few ships are heard there right now, so counts are incomplete: aisstream's receivers are coastal and sparse in places like the Gulf and Red Sea.</p>`);
+  cardBody.querySelectorAll('tr[data-gate]').forEach(tr => tr.addEventListener('click', () => {
+    const g = c.gates.find(x => x.id === tr.dataset.gate);
+    const [[x1, y1], [x2, y2]] = g.line;
+    map.fitBounds([[Math.min(x1, x2) - 0.6, Math.min(y1, y2) - 0.6], [Math.max(x1, x2) + 0.6, Math.max(y1, y2) + 0.6]], { padding: { left: 340, right: 600, top: 60, bottom: 120 } });
+    openChokepoints(g.id);
+  }));
+}
+
+function chokeDetail(g) {
+  if (!g) return '';
+  return `<div class="sub" style="margin-top:12px">Latest crossings: ${esc(g.name)}</div>
+    ${g.latest.length ? `<ul class="timeline">${g.latest.map(t => `<li><img src="${Icons.url('ship', t.cls === 'tanker' ? SHIP.Tanker : t.cls === 'cargo' ? SHIP.Cargo : SHIP.Other)}" alt="">
+      <span><a href="#" data-profile="${esc(t.mmsi)}">${esc(t.name || `MMSI ${t.mmsi}`)}</a>${t.sanc ? ' <span class="flag emg">SANCTIONED</span>' : ''}<br><small>${esc(t.cls)} · ${esc(t.dir)}</small></span>
+      <small>${ago(t.time)}</small></li>`).join('')}</ul>` : '<p class="sub">No crossings recorded in the last 24 h.</p>'}`;
+}
+
+document.getElementById('open-chokepoints').addEventListener('click', () => openChokepoints());
 
 // ---------- timeline replay ----------
 // The server records flights every minute and ships every 5 minutes (last 24 h). In replay,

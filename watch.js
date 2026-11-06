@@ -17,6 +17,7 @@ export const AREA_RULES = {
   events: 'New natural disaster',
   shipsDark: 'Moving ship stops transmitting',
   sanctioned: 'Sanctioned ship or plane is in the area',
+  shipBehaviour: 'Suspicious ship activity (transfers, cable loitering, fake positions)',
   news: 'News tagged violence',
 };
 
@@ -156,6 +157,23 @@ export function createWatch({ dir, feeds, broadcast }) {
       for (const f of planes) {
         if (!f.sanc || !inArea(item, f.lat, f.lon)) continue;
         if (fresh('sanc', `plane:${f.hex}`, 12 * 60 * MIN)) alert(item, { kind: 'sanctioned', title: `Sanctioned aircraft in ${item.label}: ${name(f)}`, detail: `${f.sanc.model || f.type} · ${f.sanc.operator || f.sanc.name} · ${f.sanc.programs.join(', ')}`, lat: f.lat, lon: f.lon, ref: { type: 'flight', id: f.hex } });
+      }
+    }
+    if (r.shipBehaviour) {
+      const what = { sts: 'Possible ship-to-ship transfer', cable: 'Ship loitering over an undersea cable',
+        jump: 'Impossible position jump', identity: 'Ship changed its identity', clone: 'Two ships using the same IMO' };
+      for (const d of feeds.shipwatch?.data || []) {
+        if (!inArea(item, d.lat, d.lon)) continue;
+        const id = d.kind === 'sts' ? `${d.a.mmsi}|${d.b.mmsi}` : d.kind === 'clone' ? d.imo : d.mmsi;
+        if (!fresh('ship', `${d.kind}:${id}`, 6 * 60 * MIN)) continue;
+        const who = d.kind === 'sts' ? `${d.a.name || d.a.mmsi} + ${d.b.name || d.b.mmsi}` : d.kind === 'clone' ? `IMO ${d.imo}` : d.name || `MMSI ${d.mmsi}`;
+        const detail = d.kind === 'sts' ? `${d.distM} m apart for ${d.minutes} min`
+          : d.kind === 'cable' ? `${d.cable}: ${d.minutes} min within ${d.cableM} m, ${d.speed} kt`
+          : d.kind === 'jump' ? `${d.distKm} km in ${d.minutes} min (would need ${d.impliedKn} kt)`
+          : d.kind === 'identity' ? `${d.field}: ${d.from} → ${d.to}`
+          : `${d.ships.length} ships, ${d.km} km apart`;
+        alert(item, { kind: 'shipwatch', title: `${what[d.kind]} in ${item.label}: ${who}`, detail, lat: d.lat, lon: d.lon,
+          ref: d.mmsi ? { type: 'ship', id: d.mmsi } : undefined });
       }
     }
     if (r.news) {

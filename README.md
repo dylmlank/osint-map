@@ -22,7 +22,7 @@ Open http://localhost:8790. You need Node 22 or newer. There's nothing to instal
 ## Watchlist and alerts
 
 - **Watch a flight or ship:** open its card and press **Watch**. You get an alert when a flight takes off, lands, loses signal, comes back, or squawks an emergency code, and when a ship stops transmitting, starts moving or stops, or changes destination.
-- **Watch an area:** press **+ Area** and drag a box on the map (or choose "Whole world instead"). Then pick the rules: military aircraft enters, emergency squawk, earthquake above a magnitude, new US wildfire, new natural disaster, moving ship goes silent, sanctioned ship or plane in the area, or news tagged violence.
+- **Watch an area:** press **+ Area** and drag a box on the map (or choose "Whole world instead"). Then pick the rules: military aircraft enters, emergency squawk, earthquake above a magnitude, new US wildfire, new natural disaster, moving ship goes silent, sanctioned ship or plane in the area, suspicious ship activity, or news tagged violence.
 - Alerts show up as pop-ups and as browser notifications (allow them when asked), and are saved under **Alerts**. Click an alert to jump to it.
 - The checks run on the server every 15 s, so they keep going even with the browser closed. The watchlist and alert history are saved in `data/watch.json`.
 - A new watch only alerts on things that show up after you create it. Watching the whole world for military aircraft is noisy (about one alert every 10 s), so whole-world watches default to emergencies and M6+ earthquakes.
@@ -60,8 +60,38 @@ Open http://localhost:8790. You need Node 22 or newer. There's nothing to instal
 | Power plants | WRI Global Power Plant Database | daily | About 35,000 plants |
 | Sanctioned ships / planes | US Treasury OFAC SDN list | daily | Ships matched by IMO number (strong) or MMSI (weaker, since MMSIs get reused or faked); planes by registration. Red ring on any layer |
 | Ships gone silent | Worked out from the ship feed | 1 min | Was moving, then no reports for 20 min–6 h. "Likely switched off" if ships nearby are still being heard, "maybe out of range" if not |
+| Suspicious ship activity | Worked out from the ship feed, cables and Natural Earth ports | 1 min | See below |
 | GPS jamming | Worked out from aircraft GPS accuracy (NACp) | 1 min | 1° squares, last hour. Only planes broadcasting their own ADS-B v2 position count. Areas you've viewed plus known hotspots (Baltic, Black Sea, E. Mediterranean, Middle East, Korea) are sampled |
 | Satellites / Starlink | CelesTrak orbit data, positions computed in the browser | every 6 h | Space stations, GPS, weather, military, geostationary, plus ~10,000 Starlink. Click one for its path over the ground |
+
+## Ship risk profiles
+
+Click any ship (or a ship in a detection, sanctions or chokepoint card) and choose **Profile & risk**. You get:
+
+- **Identity:** name, flag country (from the MMSI's first three digits, using the ITU list via [powers9/MIDs](https://github.com/powers9/MIDs)), type, size, IMO and MMSI.
+- **Risk score (0–100)** with every point explained, for example "+60 on the US sanctions list, matched by IMO", "+20 ship-to-ship transfer away from port", "+15 went silent while ships nearby kept transmitting", "+10 tanker flagged in a registry often linked to the shadow fleet". 20+ is *elevated*, 50+ is *high*. It sorts ships worth a closer look; it isn't a verdict.
+- **History (14 days):** transfers, silent periods, cable loitering, jumps, identity changes and chokepoint crossings, with markers on the map.
+- **24-hour track** drawn on the map, plus a VesselFinder link for photos and ownership.
+
+**Riskiest ships** (button under the map style) lists ships currently heard with a score of 20+.
+
+## Chokepoint traffic
+
+**Chokepoints** (button under the map style) counts ships crossing a line drawn across 11 strategic straits and canals: Hormuz, Bab-el-Mandeb, Suez, Panama, Singapore, Bosporus, Gibraltar, Dover, Skagen, Taiwan and the Cape of Good Hope. For each one it shows the last 24 h, the change from normal (the median of earlier full days, after 3 days of counting), tankers, sanctioned ships, traffic each way, a 14-day trend, and the latest ships through. Turn on **Chokepoint gates** to see the lines on the map (red = 25%+ below normal, green = 25%+ above). Counts are saved to `data/chokepoints.json`, so the normal builds up across restarts. A "thin coverage" warning means few ships are heard there right now, so the count is incomplete.
+
+## Suspicious ship activity
+
+Turn on **Suspicious ship activity** (Intelligence group) to see five kinds of detection, each with a warning icon and a line showing what happened:
+
+| Detection | Rule | Why it matters |
+|---|---|---|
+| **Ship-to-ship transfer** | A seagoing tanker (150 m+) and another big ship (100 m+) within 500 m, both at 2 kt or less, more than 20 km from a major port, for over an hour | How cargo, often sanctioned oil, changes hands at sea ("shadow fleet") |
+| **Loitering over a cable** | A cargo ship, tanker or 80 m+ vessel (not fishing) moving at 0.5–7 kt within 1 km of an undersea cable, more than 15 km from a major port, for 30+ minutes | Matches the 2023–25 Baltic cable cuts, where ships dragged anchors along the seabed. A normal crossing takes minutes. Anchored ships aren't counted: published cable routes are only accurate to a few hundred metres, so that mostly flagged ordinary anchorages. |
+| **Impossible jump** | Two position reports that would need more than ~50 kt (or twice the ship's speed + 20 kt) to connect, judged on the time the ship sent them | Usually two transmitters sharing one MMSI, or a faked position |
+| **Changed identity** | A ship's broadcast name or IMO number changes at sea | IMO numbers are permanent, so a change is a strong sign of a fake identity |
+| **Shared IMO** | Two ships broadcasting the same IMO number 50+ km apart | At least one is using a borrowed or fake identity |
+
+What's filtered out on purpose, after testing against live traffic (40-minute runs): river barges and small craft moored together, fishing and pleasure boats over coastal cables, ferries at terminals where cables come ashore, anchored ships near cables, placeholder MMSIs (111111111, 200000000…), invalid positions (91/181, 0,0, near the poles), garbled positions where one coordinate stays put and the other is corrupted (a dropped digit or flipped sign), and garbled names ("@" filler, test transmitters).
 
 ## Turn on ships
 
@@ -97,7 +127,7 @@ This tries every outside source once, live, and reports which ones answer and ho
 |---|---|
 | `server.js` | HTTP server, keeps feeds warm, live stream, timeline recording |
 | `feeds.js` | Downloads each outside source |
-| `intel.js` | Pure logic: sanctions, silent ships, GPS jamming, routes, news rows |
+| `intel.js` | Pure logic: sanctions, silent ships, suspicious ship activity, GPS jamming, routes, news rows |
 | `watch.js` | Watchlist rules and alerts |
 | `history.js` | Timeline snapshots on disk |
 | `public/` | The map (MapLibre + deck.gl), icons, styles |
@@ -105,7 +135,7 @@ This tries every outside source once, live, and reports which ones answer and ho
 ## Limits
 
 - GDELT's places and categories are guessed by software from article text, and they're often wrong. Treat a news dot as a lead, not a fact.
-- **Sanctions, silent ships and jamming are leads, not proof.** Only the US list is used (not EU/UK). A ship can go quiet because it left receiver range. Jamming coverage is only as good as the number of planes flying there, so it's thin at night.
+- **Sanctions, silent ships, suspicious ship activity and jamming are leads, not proof.** Only the US list is used (not EU/UK). A ship can go quiet because it left receiver range. Ship detections only cover what aisstream's coastal receivers hear, so transfers far offshore are often missed, and small or unlisted harbours aren't excluded the way major ports are. Jamming coverage is only as good as the number of planes flying there, so it's thin at night.
 - CelesTrak refuses repeat downloads of the same orbit data within 2 hours. If a group is missing, the server retries it every 10 minutes.
 - Some aircraft are hidden from public trackers on purpose, and ships can switch AIS off. If something is missing from the map, that doesn't prove it isn't there.
 - Flight coverage depends on volunteer receivers, so it's thin in some places (Japan, for example). Ship coverage from aisstream is thin far from shore and in the Persian Gulf.

@@ -39,6 +39,9 @@ const FEEDS = {
   sanctions:  { fn: F.sanctions,       every: 24 * H },
   sanctioned: { fn: F.sanctionedShips, every: 1 * M,  live: true },
   dark:       { fn: F.darkShips,       every: 1 * M,  live: true },
+  shipwatch:  { fn: F.shipDetections,  every: 1 * M,  live: true },
+  chokepoints: { fn: F.chokepointTraffic, every: 1 * M },
+  riskiest:   { fn: F.riskiestShips,   every: 2 * M },
   jamming:    { fn: F.jamming,         every: 1 * M,  live: true },
   satellites: { fn: F.satellites,      every: 10 * M }, // cheap: only downloads when due (see feeds.js)
 };
@@ -269,7 +272,11 @@ http.createServer(async (req, res) => {
     if (url.pathname === '/api/find') return send(res, 200, await F.findFlight(q.get('q') || ''));
     if (url.pathname === '/api/ship') {
       const s = F.getShip(q.get('mmsi'));
-      return s ? send(res, 200, s) : send(res, 404, { error: 'not heard recently' });
+      return s ? send(res, 200, { ...s, trail: undefined }) : send(res, 404, { error: 'not heard recently' });
+    }
+    if (url.pathname === '/api/ship/profile') {
+      const p = await F.shipProfile(q.get('mmsi'));
+      return p ? send(res, 200, p) : send(res, 404, { error: 'no record of this ship' });
     }
     if (url.pathname === '/api/flight') {
       const errors = [];
